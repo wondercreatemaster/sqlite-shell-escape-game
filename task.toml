@@ -25,11 +25,12 @@ junior_time_estimate_min = 240
 # - /app/game/escape.db          (SQLite database that must be hardened in place)
 # - /app/coreutils-9.5.tar.gz    (staged GNU coreutils 9.5 source tarball; offline)
 # - /opt/seed/seed.sql           (pristine seed used to build the initial database)
-# - /opt/java-libs/              (SQLite JDBC driver on the classpath for the Java migration)
+# - /opt/java-libs/              (optional SQLite JDBC driver, if solving via Java)
+# - /opt/wheels/                 (offline wheel cache for the verifier dependencies)
 #
-# Verifier dependencies (pytest, pytest-json-ctrf) are installed system-wide in
-# the image; tests/test.sh runs the system Python and uses only the standard
-# library (sqlite3, tarfile, hashlib) plus pytest.
+# Verifier dependencies (pytest, pytest-json-ctrf) are installed at test time by
+# tests/test.sh from the offline wheel cache into the system-wide Python; the
+# tests themselves use only the standard library (sqlite3, tarfile, hashlib).
 
 # Verifier: runs the test script to check task completion
 [verifier]

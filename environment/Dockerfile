@@ -12,10 +12,11 @@ RUN apt-get update \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Verifier dependencies (installed system-wide in the image).
-RUN python -m pip install --no-cache-dir \
-    pytest==8.4.1 \
-    pytest-json-ctrf==0.3.5
+# Cache verifier wheels so tests/test.sh can install them at test time (offline).
+RUN mkdir -p /opt/wheels \
+    && python -m pip download --only-binary=:all: --dest /opt/wheels \
+       pytest==8.4.1 \
+       pytest-json-ctrf==0.3.5
 
 # Pinned SQLite JDBC driver on the classpath for the Java migration.
 RUN mkdir -p /opt/java-libs \

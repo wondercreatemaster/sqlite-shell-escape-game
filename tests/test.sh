@@ -1,7 +1,9 @@
 #!/bin/bash
 
-# Verifier dependencies are installed in environment/Dockerfile.
-# Add task-specific verifier-only Python packages there, not here.
+# Install verifier dependencies at test time from the offline wheel cache that
+# environment/Dockerfile populated at build. No network is needed here.
+python -m pip install --no-index --find-links /opt/wheels --break-system-packages \
+  pytest==8.4.1 pytest-json-ctrf==0.3.5 >/dev/null
 
 mkdir -p /logs/verifier
 
