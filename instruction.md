@@ -1,1 +1,10 @@
-Create a file called /app/hello.txt. Write "Hello, world!" to it.
+We ship a tiny "shell-escape" puzzle game backed by a SQLite database at `/app/game/escape.db`, and the seeded config in there right now is a security mess: room hints leak the answers in plaintext, every room is unlocked, there are wildcard / `admin` "unlock everything" entries, and several challenges point at unsafe commands that aren't even part of our vetted toolset. I need you to write a migration **in Java** that hardens this database in place.
+
+The only commands we consider safe are the standard GNU coreutils utilities. The coreutils 9.5 source tarball is already staged at `/app/coreutils-9.5.tar.gz` (there's no network access) — the canonical list of utility names lives in that tarball's top-level `README`, so pull it out with shell tools. Then apply exactly these rules to `/app/game/escape.db`:
+
+1. `rooms.hint` — wipe every hint to SQL `NULL` (we don't store plaintext hints anymore).
+2. `rooms.is_locked` — set it to `0` for the entry room (`id = 1`) and `1` for every other room.
+3. `allowed_commands` — keep a row only if its command's *program* (the basename of the first whitespace-separated token) is one of the coreutils utilities from the README, **and** that program is not in the denylist `rm, dd, shred, chroot, runcon`, **and** the full command string contains no `*` or `?` character. Delete every other row.
+4. `challenge_checks` — after step 3, delete any row whose `(room_id, expected_command)` does not exactly match a surviving `allowed_commands` row (same `room_id`, identical `command` string).
+
+Don't alter the table schemas and don't renumber the rooms. A SQLite JDBC driver is already on the classpath under `/opt/java-libs/`, so do the database work through Java (JDBC), not by hand-editing rows. When you're done I'll verify by comparing a canonical dump of the three tables — `rooms` ordered by `id`, and `allowed_commands` / `challenge_checks` ordered by their contents — against the expected hardened state.

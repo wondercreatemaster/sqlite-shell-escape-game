@@ -5,21 +5,31 @@ version = "2.0"
 [metadata]
 author_name = "anonymous"
 author_email = "anonymous"
-difficulty = "unknown"
-category = "software-engineering"
+difficulty = "hard"
+category = "security"
 # Options for subcategories are: "long_context", "tool_specific", "api_integration", "db_interaction", "ui_building"
-subcategories = [ ]
+subcategories = [ "db_interaction", "tool_specific",]
 # The number of milestones in the task (can be zero if not a milestone task)
 number_of_milestones = 0
 # Size of the codebase: minimal -> 0-20 files, small -> 20+ files, large -> 200+ files
 codebase_size = "minimal"
 # Coding languages used in the oracle solution or required by the agent
-languages = [ "bash" ]
+languages = [ "java", "sql", "shell",]
 # For tool_specific, api_integration, and db_interaction subcategories, please include specific tool, api framework, or database software
-tags = [ "file-operations",]
+tags = [ "sqlite", "coreutils", "jdbc", "java",]
 # Estimated time to complete (minutes)
-expert_time_estimate_min = 60
-junior_time_estimate_min = 120
+expert_time_estimate_min = 120
+junior_time_estimate_min = 240
+
+# Files referenced by the task and its verifier:
+# - /app/game/escape.db          (SQLite database that must be hardened in place)
+# - /app/coreutils-9.5.tar.gz    (staged GNU coreutils 9.5 source tarball; offline)
+# - /opt/seed/seed.sql           (pristine seed used to build the initial database)
+# - /opt/java-libs/              (SQLite JDBC driver on the classpath for the Java migration)
+#
+# Verifier dependencies (pytest, pytest-json-ctrf) are installed system-wide in
+# the image; tests/test.sh runs the system Python and uses only the standard
+# library (sqlite3, tarfile, hashlib) plus pytest.
 
 # Verifier: runs the test script to check task completion
 [verifier]
@@ -32,7 +42,7 @@ timeout_sec = 900.0
 # Sandbox environment limits
 [environment]
 allow_internet = false
-build_timeout_sec = 600.0
+build_timeout_sec = 900.0
 cpus = 2
 memory_mb = 4096
 storage_mb = 10240
