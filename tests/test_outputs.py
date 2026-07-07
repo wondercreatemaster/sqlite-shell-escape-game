@@ -1,25 +1,42 @@
 """End-to-end verification for the Shell-Escape database hardening task.
 
-The expected hardened state is recomputed independently from the pristine seed
-(`/opt/seed/seed.sql`) and the staged coreutils tarball
-(`/app/coreutils-9.5.tar.gz`), then compared against the agent's database at
-`/app/game/escape.db`. Nothing is hard-coded, so the tests stay correct for the
-exact coreutils release that is actually staged in the image.
+The expected hardened state is recomputed from trusted inputs that the verifier
+carries itself -- a pristine copy of the seed shipped alongside this file
+(`tests/seed_reference.sql`) and the GNU coreutils 9.5 utility set embedded
+below -- then compared against the agent's database at `/app/game/escape.db`.
+The verifier deliberately does NOT read any agent-writable file (e.g.
+`/opt/seed/seed.sql` or `/app/coreutils-9.5.tar.gz`) when deriving the expected
+state, so an agent cannot move the goalposts by tampering with those inputs.
 """
 
 import hashlib
 import os
 import re
 import sqlite3
-import tarfile
 from pathlib import Path
 
 DB_PATH = "/app/game/escape.db"
-SEED_PATH = "/opt/seed/seed.sql"
-TARBALL_PATH = "/app/coreutils-9.5.tar.gz"
+SEED_PATH = str(Path(__file__).resolve().parent / "seed_reference.sql")
 
 DENYLIST = {"rm", "dd", "shred", "chroot", "runcon"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# The programs shipped by GNU coreutils 9.5 (the trusted allowlist). This is the
+# same set the agent is expected to extract from the staged tarball's README; we
+# embed it here so the verifier's reference does not depend on any file the agent
+# could modify during the task.
+COREUTILS_9_5 = frozenset(
+    """
+    arch base32 base64 basename basenc cat chcon chgrp chmod chown chroot cksum
+    comm cp csplit cut date dd df dir dircolors dirname du echo env expand expr
+    factor false fmt fold groups head hostid id install join kill link ln logname
+    ls md5sum mkdir mkfifo mknod mktemp mv nice nl nohup nproc numfmt od paste
+    pathchk pinky pr printenv printf ptx pwd readlink realpath rm rmdir runcon seq
+    sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf sleep sort split
+    stat stdbuf stty sum sync tac tail tee test timeout touch tr true truncate
+    tsort tty uname unexpand uniq unlink uptime users vdir wc who whoami yes
+    """.split()
+)
 
 
 def _stage_program(stage: str):
@@ -60,37 +77,9 @@ def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _coreutils_utilities() -> set:
-    """Parse the vetted utility names from the coreutils tarball's top-level README."""
-    with tarfile.open(TARBALL_PATH, "r:gz") as tf:
-        member = None
-        for m in tf.getmembers():
-            if m.name.endswith("/README") and m.name.count("/") == 1:
-                member = m
-                break
-        assert member is not None, "README not found in coreutils tarball"
-        text = tf.extractfile(member).read().decode("utf-8", "replace")
-
-    grab = False
-    started = False
-    tokens = []
-    for line in text.splitlines():
-        if not grab:
-            if "programs that can be built" in line:
-                grab = True
-            continue
-        if line.strip() == "":
-            if started:
-                break
-            continue
-        started = True
-        tokens.extend(line.replace("[", "").replace("]", "").split())
-    return set(tokens)
-
-
 def _build_reference() -> sqlite3.Connection:
     """Recreate the seed DB in memory and apply the five hardening rules to it."""
-    approved = _coreutils_utilities()
+    approved = COREUTILS_9_5
     con = sqlite3.connect(":memory:")
     con.executescript(Path(SEED_PATH).read_text())
     cur = con.cursor()
@@ -208,7 +197,7 @@ def test_room_lock_state():
 
 def test_allowed_commands_are_whitelisted():
     """Rule 3: every surviving command is safe (all stage programs vetted, no glob)."""
-    approved = _coreutils_utilities()
+    approved = COREUTILS_9_5
     con = _open_agent_db()
     try:
         rows = con.execute("SELECT command FROM allowed_commands").fetchall()
