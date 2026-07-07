@@ -9,6 +9,7 @@ exact coreutils release that is actually staged in the image.
 
 import hashlib
 import os
+import re
 import sqlite3
 import tarfile
 from pathlib import Path
@@ -18,14 +19,45 @@ SEED_PATH = "/opt/seed/seed.sql"
 TARBALL_PATH = "/app/coreutils-9.5.tar.gz"
 
 DENYLIST = {"rm", "dd", "shred", "chroot", "runcon"}
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
-def _program(command: str) -> str:
-    """Program of a command: basename of its first whitespace-separated token."""
-    tokens = command.strip().split()
-    if not tokens:
-        return ""
-    return os.path.basename(tokens[0])
+def _stage_program(stage: str):
+    """Program of one pipeline stage, or None if the stage names no program."""
+    tokens = stage.split()
+    i = 0
+    while i < len(tokens) and ASSIGN.match(tokens[i]):
+        i += 1
+    if i >= len(tokens):
+        return None
+    prog = os.path.basename(tokens[i])
+    if prog == "env":
+        i += 1
+        while i < len(tokens) and (tokens[i].startswith("-") or ASSIGN.match(tokens[i])):
+            i += 1
+        if i >= len(tokens):
+            return "env"
+        prog = os.path.basename(tokens[i])
+    return prog
+
+
+def _programs(command: str):
+    """All programs a command runs, one entry per `|`-separated pipeline stage."""
+    return [_stage_program(stage) for stage in command.split("|")]
+
+
+def _is_safe(command: str, approved: set) -> bool:
+    """A command is safe iff every stage program is vetted, non-denylisted, no glob."""
+    if "*" in command or "?" in command:
+        return False
+    for prog in _programs(command):
+        if prog is None or prog not in approved or prog in DENYLIST:
+            return False
+    return True
+
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _coreutils_utilities() -> set:
@@ -57,7 +89,7 @@ def _coreutils_utilities() -> set:
 
 
 def _build_reference() -> sqlite3.Connection:
-    """Recreate the seed DB in memory and apply the four hardening rules to it."""
+    """Recreate the seed DB in memory and apply the five hardening rules to it."""
     approved = _coreutils_utilities()
     con = sqlite3.connect(":memory:")
     con.executescript(Path(SEED_PATH).read_text())
@@ -71,10 +103,7 @@ def _build_reference() -> sqlite3.Connection:
     for row_id, command in cur.execute(
         "SELECT id, command FROM allowed_commands"
     ).fetchall():
-        wildcard = "*" in command or "?" in command
-        prog = _program(command)
-        keep = (not wildcard) and (prog in approved) and (prog not in DENYLIST)
-        if not keep:
+        if not _is_safe(command, approved):
             cur.execute("DELETE FROM allowed_commands WHERE id = ?", (row_id,))
 
     # Rule 4
@@ -84,6 +113,18 @@ def _build_reference() -> sqlite3.Connection:
         "WHERE a.room_id = challenge_checks.room_id "
         "AND a.command = challenge_checks.expected_command)"
     )
+
+    # Rule 5
+    for (room_id,) in cur.execute("SELECT id FROM rooms ORDER BY id").fetchall():
+        cmds = [
+            c
+            for (c,) in cur.execute(
+                "SELECT command FROM allowed_commands WHERE room_id = ?", (room_id,)
+            ).fetchall()
+        ]
+        digest = _sha256_hex("\n".join(sorted(cmds)))
+        cur.execute("UPDATE rooms SET cmd_digest = ? WHERE id = ?", (digest, room_id))
+
     con.commit()
     return con
 
@@ -93,7 +134,7 @@ def _canonical(con: sqlite3.Connection) -> str:
     cur = con.cursor()
     parts = []
     for row in cur.execute(
-        "SELECT id, name, description, COALESCE(hint, ''), is_locked "
+        "SELECT id, name, description, COALESCE(hint, ''), is_locked, cmd_digest "
         "FROM rooms ORDER BY id"
     ):
         parts.append("R|" + "|".join(str(x) for x in row))
@@ -129,7 +170,7 @@ def test_schema_unchanged():
     con = _open_agent_db()
     try:
         expected = {
-            "rooms": ["id", "name", "description", "hint", "is_locked"],
+            "rooms": ["id", "name", "description", "hint", "is_locked", "cmd_digest"],
             "allowed_commands": ["id", "room_id", "command"],
             "challenge_checks": ["id", "room_id", "expected_command", "points"],
         }
@@ -145,9 +186,7 @@ def test_no_plaintext_hints():
     """Rule 1: every room hint has been wiped to NULL."""
     con = _open_agent_db()
     try:
-        leaked = con.execute(
-            "SELECT id FROM rooms WHERE hint IS NOT NULL"
-        ).fetchall()
+        leaked = con.execute("SELECT id FROM rooms WHERE hint IS NOT NULL").fetchall()
         assert not leaked, f"Rooms still carry plaintext hints: {leaked}"
     finally:
         con.close()
@@ -168,18 +207,16 @@ def test_room_lock_state():
 
 
 def test_allowed_commands_are_whitelisted():
-    """Rule 3: surviving commands are non-wildcard, vetted, non-denylisted coreutils."""
+    """Rule 3: every surviving command is safe (all stage programs vetted, no glob)."""
     approved = _coreutils_utilities()
     con = _open_agent_db()
     try:
         rows = con.execute("SELECT command FROM allowed_commands").fetchall()
         for (command,) in rows:
-            assert "*" not in command and "?" not in command, (
-                f"Wildcard command survived: {command!r}"
+            assert _is_safe(command, approved), (
+                f"Unsafe command survived hardening: {command!r} "
+                f"(programs: {_programs(command)})"
             )
-            prog = _program(command)
-            assert prog in approved, f"Non-coreutils command survived: {command!r}"
-            assert prog not in DENYLIST, f"Denylisted command survived: {command!r}"
     finally:
         con.close()
 
@@ -194,6 +231,28 @@ def test_no_orphan_challenges():
             "WHERE a.room_id = c.room_id AND a.command = c.expected_command)"
         ).fetchall()
         assert not orphans, f"Orphan challenge_checks rows remain: {orphans}"
+    finally:
+        con.close()
+
+
+def test_cmd_digests_recomputed():
+    """Rule 5: each room's cmd_digest matches SHA-256 of its sorted surviving commands."""
+    con = _open_agent_db()
+    try:
+        for (room_id,) in con.execute("SELECT id FROM rooms ORDER BY id").fetchall():
+            cmds = [
+                c
+                for (c,) in con.execute(
+                    "SELECT command FROM allowed_commands WHERE room_id = ?", (room_id,)
+                ).fetchall()
+            ]
+            expected = _sha256_hex("\n".join(sorted(cmds)))
+            (actual,) = con.execute(
+                "SELECT cmd_digest FROM rooms WHERE id = ?", (room_id,)
+            ).fetchone()
+            assert actual == expected, (
+                f"Room {room_id} cmd_digest mismatch: expected {expected}, got {actual}"
+            )
     finally:
         con.close()
 
