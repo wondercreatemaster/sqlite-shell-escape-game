@@ -10,15 +10,18 @@ state, so an agent cannot move the goalposts by tampering with those inputs.
 """
 
 import hashlib
+import hmac
 import os
 import re
 import sqlite3
+from collections import deque
 from pathlib import Path
 
 DB_PATH = "/app/game/escape.db"
 SEED_PATH = str(Path(__file__).resolve().parent / "seed_reference.sql")
 
 DENYLIST = {"rm", "dd", "shred", "chroot", "runcon"}
+HMAC_KEY = b"shell-escape"
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 # The programs shipped by GNU coreutils 9.5 (the trusted allowlist). This is the
@@ -37,6 +40,12 @@ COREUTILS_9_5 = frozenset(
     tsort tty uname unexpand uniq unlink uptime users vdir wc who whoami yes
     """.split()
 )
+
+
+def _canon(command: str) -> str:
+    """Canonical form: strip inline comment, collapse whitespace runs, trim."""
+    command = command.split("#", 1)[0]
+    return re.sub(r"\s+", " ", command).strip()
 
 
 def _stage_program(stage: str):
@@ -59,12 +68,12 @@ def _stage_program(stage: str):
 
 
 def _programs(command: str):
-    """All programs a command runs, one entry per `|`-separated pipeline stage."""
+    """All programs a (canonical) command runs, one per `|`-separated stage."""
     return [_stage_program(stage) for stage in command.split("|")]
 
 
 def _is_safe(command: str, approved: set) -> bool:
-    """A command is safe iff every stage program is vetted, non-denylisted, no glob."""
+    """A canonical command is safe iff every stage program is vetted, no glob."""
     if "*" in command or "?" in command:
         return False
     for prog in _programs(command):
@@ -78,24 +87,32 @@ def _sha256_hex(text: str) -> str:
 
 
 def _build_reference() -> sqlite3.Connection:
-    """Recreate the seed DB in memory and apply the five hardening rules to it."""
+    """Recreate the seed DB in memory and apply the eight hardening rules to it."""
     approved = COREUTILS_9_5
     con = sqlite3.connect(":memory:")
     con.executescript(Path(SEED_PATH).read_text())
     cur = con.cursor()
 
-    # Rule 1 & 2
-    cur.execute("UPDATE rooms SET hint = NULL")
-    cur.execute("UPDATE rooms SET is_locked = CASE WHEN id = 1 THEN 0 ELSE 1 END")
+    # Rule 1: canonicalize command columns.
+    for table, col in (
+        ("allowed_commands", "command"),
+        ("challenge_checks", "expected_command"),
+        ("doors", "via_command"),
+    ):
+        for row_id, value in cur.execute(f"SELECT id, {col} FROM {table}").fetchall():
+            cur.execute(
+                f"UPDATE {table} SET {col} = ? WHERE id = ?", (_canon(value), row_id)
+            )
 
-    # Rule 3
-    for row_id, command in cur.execute(
-        "SELECT id, command FROM allowed_commands"
-    ).fetchall():
+    # Rule 2: wipe hints.
+    cur.execute("UPDATE rooms SET hint = NULL")
+
+    # Rule 3: whitelist allowed_commands.
+    for row_id, command in cur.execute("SELECT id, command FROM allowed_commands").fetchall():
         if not _is_safe(command, approved):
             cur.execute("DELETE FROM allowed_commands WHERE id = ?", (row_id,))
 
-    # Rule 4
+    # Rule 4: prune orphan challenge_checks.
     cur.execute(
         "DELETE FROM challenge_checks WHERE NOT EXISTS ("
         "SELECT 1 FROM allowed_commands a "
@@ -103,8 +120,35 @@ def _build_reference() -> sqlite3.Connection:
         "AND a.command = challenge_checks.expected_command)"
     )
 
-    # Rule 5
-    for (room_id,) in cur.execute("SELECT id FROM rooms ORDER BY id").fetchall():
+    # Rule 5: delete non-usable doors.
+    cur.execute(
+        "DELETE FROM doors WHERE NOT EXISTS ("
+        "SELECT 1 FROM allowed_commands a "
+        "WHERE a.room_id = doors.from_room AND a.command = doors.via_command)"
+    )
+
+    # Rule 6: reachability from room 1 over surviving doors.
+    adj = {}
+    for f, t in cur.execute("SELECT from_room, to_room FROM doors").fetchall():
+        adj.setdefault(f, []).append(t)
+    reachable = {1}
+    queue = deque([1])
+    while queue:
+        u = queue.popleft()
+        for v in adj.get(u, []):
+            if v not in reachable:
+                reachable.add(v)
+                queue.append(v)
+    room_ids = [r for (r,) in cur.execute("SELECT id FROM rooms ORDER BY id").fetchall()]
+    for room_id in room_ids:
+        cur.execute(
+            "UPDATE rooms SET is_locked = ? WHERE id = ?",
+            (0 if room_id in reachable else 1, room_id),
+        )
+
+    # Rule 7: per-room cmd_digest.
+    digests = {}
+    for room_id in room_ids:
         cmds = [
             c
             for (c,) in cur.execute(
@@ -112,14 +156,20 @@ def _build_reference() -> sqlite3.Connection:
             ).fetchall()
         ]
         digest = _sha256_hex("\n".join(sorted(cmds)))
+        digests[room_id] = digest
         cur.execute("UPDATE rooms SET cmd_digest = ? WHERE id = ?", (digest, room_id))
+
+    # Rule 8: signed manifest.
+    message = "\n".join(f"{room_id}={digests[room_id]}" for room_id in room_ids)
+    manifest = hmac.new(HMAC_KEY, message.encode("utf-8"), hashlib.sha256).hexdigest()
+    cur.execute("UPDATE meta SET value = ? WHERE key = 'manifest'", (manifest,))
 
     con.commit()
     return con
 
 
 def _canonical(con: sqlite3.Connection) -> str:
-    """Order-independent canonical dump of the three tables (see instruction.md)."""
+    """Order-independent canonical dump of all five tables (see instruction.md)."""
     cur = con.cursor()
     parts = []
     for row in cur.execute(
@@ -136,6 +186,13 @@ def _canonical(con: sqlite3.Connection) -> str:
         "ORDER BY room_id, expected_command, points"
     ):
         parts.append("C|" + "|".join(str(x) for x in row))
+    for row in cur.execute(
+        "SELECT from_room, to_room, via_command FROM doors "
+        "ORDER BY from_room, to_room, via_command"
+    ):
+        parts.append("D|" + "|".join(str(x) for x in row))
+    for row in cur.execute("SELECT key, value FROM meta ORDER BY key"):
+        parts.append("M|" + "|".join(str(x) for x in row))
     return "\n".join(parts)
 
 
@@ -155,13 +212,15 @@ def test_database_exists():
 
 
 def test_schema_unchanged():
-    """The three original tables still exist with their original columns."""
+    """All five tables still exist with their original columns."""
     con = _open_agent_db()
     try:
         expected = {
             "rooms": ["id", "name", "description", "hint", "is_locked", "cmd_digest"],
             "allowed_commands": ["id", "room_id", "command"],
             "challenge_checks": ["id", "room_id", "expected_command", "points"],
+            "doors": ["id", "from_room", "to_room", "via_command"],
+            "meta": ["key", "value"],
         }
         for table, cols in expected.items():
             info = con.execute(f"PRAGMA table_info({table})").fetchall()
@@ -171,26 +230,26 @@ def test_schema_unchanged():
         con.close()
 
 
-def test_no_plaintext_hints():
-    """Rule 1: every room hint has been wiped to NULL."""
+def test_commands_are_canonical():
+    """Rule 1: stored command strings are in canonical form."""
     con = _open_agent_db()
     try:
-        leaked = con.execute("SELECT id FROM rooms WHERE hint IS NOT NULL").fetchall()
-        assert not leaked, f"Rooms still carry plaintext hints: {leaked}"
+        for command, in con.execute("SELECT command FROM allowed_commands"):
+            assert command == _canon(command), f"Non-canonical command: {command!r}"
+        for command, in con.execute("SELECT expected_command FROM challenge_checks"):
+            assert command == _canon(command), f"Non-canonical expected_command: {command!r}"
+        for command, in con.execute("SELECT via_command FROM doors"):
+            assert command == _canon(command), f"Non-canonical via_command: {command!r}"
     finally:
         con.close()
 
 
-def test_room_lock_state():
-    """Rule 2: only the entry room (id=1) is unlocked; all others are locked."""
+def test_no_plaintext_hints():
+    """Rule 2: every room hint has been wiped to NULL."""
     con = _open_agent_db()
     try:
-        rows = con.execute("SELECT id, is_locked FROM rooms ORDER BY id").fetchall()
-        for room_id, locked in rows:
-            expected = 0 if room_id == 1 else 1
-            assert locked == expected, (
-                f"Room {room_id} has is_locked={locked}, expected {expected}"
-            )
+        leaked = con.execute("SELECT id FROM rooms WHERE hint IS NOT NULL").fetchall()
+        assert not leaked, f"Rooms still carry plaintext hints: {leaked}"
     finally:
         con.close()
 
@@ -200,11 +259,9 @@ def test_allowed_commands_are_whitelisted():
     approved = COREUTILS_9_5
     con = _open_agent_db()
     try:
-        rows = con.execute("SELECT command FROM allowed_commands").fetchall()
-        for (command,) in rows:
+        for command, in con.execute("SELECT command FROM allowed_commands"):
             assert _is_safe(command, approved), (
-                f"Unsafe command survived hardening: {command!r} "
-                f"(programs: {_programs(command)})"
+                f"Unsafe command survived: {command!r} (programs: {_programs(command)})"
             )
     finally:
         con.close()
@@ -224,11 +281,50 @@ def test_no_orphan_challenges():
         con.close()
 
 
-def test_cmd_digests_recomputed():
-    """Rule 5: each room's cmd_digest matches SHA-256 of its sorted surviving commands."""
+def test_doors_are_usable():
+    """Rule 5: every surviving door's via_command survives in its from_room."""
     con = _open_agent_db()
     try:
-        for (room_id,) in con.execute("SELECT id FROM rooms ORDER BY id").fetchall():
+        bad = con.execute(
+            "SELECT d.from_room, d.to_room, d.via_command FROM doors d "
+            "WHERE NOT EXISTS (SELECT 1 FROM allowed_commands a "
+            "WHERE a.room_id = d.from_room AND a.command = d.via_command)"
+        ).fetchall()
+        assert not bad, f"Non-usable doors remain: {bad}"
+    finally:
+        con.close()
+
+
+def test_reachability_lock_state():
+    """Rule 6: is_locked=0 iff the room is reachable from room 1 via surviving doors."""
+    con = _open_agent_db()
+    try:
+        adj = {}
+        for f, t in con.execute("SELECT from_room, to_room FROM doors"):
+            adj.setdefault(f, []).append(t)
+        reachable = {1}
+        queue = deque([1])
+        while queue:
+            u = queue.popleft()
+            for v in adj.get(u, []):
+                if v not in reachable:
+                    reachable.add(v)
+                    queue.append(v)
+        for room_id, locked in con.execute("SELECT id, is_locked FROM rooms ORDER BY id"):
+            expected = 0 if room_id in reachable else 1
+            assert locked == expected, (
+                f"Room {room_id} is_locked={locked}, expected {expected} "
+                f"(reachable={sorted(reachable)})"
+            )
+    finally:
+        con.close()
+
+
+def test_cmd_digests_recomputed():
+    """Rule 7: each room's cmd_digest is SHA-256 of its sorted surviving commands."""
+    con = _open_agent_db()
+    try:
+        for room_id, in con.execute("SELECT id FROM rooms ORDER BY id"):
             cmds = [
                 c
                 for (c,) in con.execute(
@@ -242,6 +338,23 @@ def test_cmd_digests_recomputed():
             assert actual == expected, (
                 f"Room {room_id} cmd_digest mismatch: expected {expected}, got {actual}"
             )
+    finally:
+        con.close()
+
+
+def test_manifest_hmac():
+    """Rule 8: meta.manifest is the HMAC-SHA256 over the per-room digest lines."""
+    con = _open_agent_db()
+    try:
+        rows = con.execute("SELECT id, cmd_digest FROM rooms ORDER BY id").fetchall()
+        message = "\n".join(f"{room_id}={digest}" for room_id, digest in rows)
+        expected = hmac.new(HMAC_KEY, message.encode("utf-8"), hashlib.sha256).hexdigest()
+        (actual,) = con.execute(
+            "SELECT value FROM meta WHERE key = 'manifest'"
+        ).fetchone()
+        assert actual == expected, (
+            f"manifest mismatch: expected {expected}, got {actual}"
+        )
     finally:
         con.close()
 

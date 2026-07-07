@@ -29,27 +29,40 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 public class Migrate {
 
     static final Pattern ASSIGN = Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*=");
-    static Set<String> approved;
+    static final Pattern WS = Pattern.compile("\\s+");
     static final Set<String> DENY =
             new HashSet<>(Arrays.asList("rm", "dd", "shred", "chroot", "runcon"));
+    static Set<String> approved;
+
+    static String canon(String s) {
+        int hash = s.indexOf('#');
+        if (hash >= 0) {
+            s = s.substring(0, hash);
+        }
+        return WS.matcher(s).replaceAll(" ").trim();
+    }
 
     static String basename(String t) {
         int slash = t.lastIndexOf('/');
         return slash >= 0 ? t.substring(slash + 1) : t;
     }
 
-    // The program of a single pipeline stage, or null if none.
     static String stageProgram(String stage) {
         String s = stage.trim();
         String[] toks = s.isEmpty() ? new String[0] : s.split("\\s+");
@@ -88,14 +101,42 @@ public class Migrate {
         return true;
     }
 
-    static String sha256Hex(String s) throws Exception {
-        byte[] digest = MessageDigest.getInstance("SHA-256")
-                .digest(s.getBytes("UTF-8"));
+    static String toHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder();
-        for (byte b : digest) {
+        for (byte b : bytes) {
             sb.append(String.format("%02x", b));
         }
         return sb.toString();
+    }
+
+    static String sha256Hex(String s) throws Exception {
+        return toHex(MessageDigest.getInstance("SHA-256").digest(s.getBytes("UTF-8")));
+    }
+
+    static String hmacSha256Hex(String key, String msg) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(key.getBytes("UTF-8"), "HmacSHA256"));
+        return toHex(mac.doFinal(msg.getBytes("UTF-8")));
+    }
+
+    // Canonicalize a text column in place (by primary key id).
+    static void canonicalize(Connection c, String table, String col) throws Exception {
+        Map<Integer, String> updates = new HashMap<>();
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT id, " + col + " FROM " + table)) {
+            while (rs.next()) {
+                updates.put(rs.getInt(1), canon(rs.getString(2)));
+            }
+        }
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE " + table + " SET " + col + " = ? WHERE id = ?")) {
+            for (Map.Entry<Integer, String> e : updates.entrySet()) {
+                ps.setString(1, e.getValue());
+                ps.setInt(2, e.getKey());
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -113,18 +154,20 @@ public class Migrate {
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
             c.setAutoCommit(false);
 
-            // Rule 1 & 2: room hardening.
+            // Rule 1: canonicalize command columns.
+            canonicalize(c, "allowed_commands", "command");
+            canonicalize(c, "challenge_checks", "expected_command");
+            canonicalize(c, "doors", "via_command");
+
+            // Rule 2: wipe hints.
             try (Statement st = c.createStatement()) {
                 st.executeUpdate("UPDATE rooms SET hint = NULL");
-                st.executeUpdate(
-                    "UPDATE rooms SET is_locked = CASE WHEN id = 1 THEN 0 ELSE 1 END");
             }
 
             // Rule 3: whitelist allowed_commands.
             List<Integer> drop = new ArrayList<>();
             try (Statement st = c.createStatement();
-                 ResultSet rs = st.executeQuery(
-                         "SELECT id, command FROM allowed_commands")) {
+                 ResultSet rs = st.executeQuery("SELECT id, command FROM allowed_commands")) {
                 while (rs.next()) {
                     if (!isSafe(rs.getString(2))) {
                         drop.add(rs.getInt(1));
@@ -149,7 +192,35 @@ public class Migrate {
                     + "AND a.command = challenge_checks.expected_command)");
             }
 
-            // Rule 5: recompute rooms.cmd_digest over surviving commands.
+            // Rule 5: delete non-usable doors.
+            try (Statement st = c.createStatement()) {
+                st.executeUpdate(
+                    "DELETE FROM doors WHERE NOT EXISTS ("
+                    + "SELECT 1 FROM allowed_commands a "
+                    + "WHERE a.room_id = doors.from_room "
+                    + "AND a.command = doors.via_command)");
+            }
+
+            // Rule 6: reachability from room 1 over surviving doors.
+            Map<Integer, List<Integer>> adj = new HashMap<>();
+            try (Statement st = c.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT from_room, to_room FROM doors")) {
+                while (rs.next()) {
+                    adj.computeIfAbsent(rs.getInt(1), k -> new ArrayList<>()).add(rs.getInt(2));
+                }
+            }
+            Set<Integer> reachable = new HashSet<>();
+            ArrayDeque<Integer> queue = new ArrayDeque<>();
+            reachable.add(1);
+            queue.add(1);
+            while (!queue.isEmpty()) {
+                int u = queue.poll();
+                for (int v : adj.getOrDefault(u, Collections.emptyList())) {
+                    if (reachable.add(v)) {
+                        queue.add(v);
+                    }
+                }
+            }
             List<Integer> roomIds = new ArrayList<>();
             try (Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery("SELECT id FROM rooms ORDER BY id")) {
@@ -157,6 +228,18 @@ public class Migrate {
                     roomIds.add(rs.getInt(1));
                 }
             }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE rooms SET is_locked = ? WHERE id = ?")) {
+                for (int roomId : roomIds) {
+                    ps.setInt(1, reachable.contains(roomId) ? 0 : 1);
+                    ps.setInt(2, roomId);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+
+            // Rule 7: per-room cmd_digest over surviving commands.
+            Map<Integer, String> digests = new HashMap<>();
             for (int roomId : roomIds) {
                 List<String> cmds = new ArrayList<>();
                 try (PreparedStatement ps = c.prepareStatement(
@@ -170,12 +253,25 @@ public class Migrate {
                 }
                 Collections.sort(cmds);
                 String digest = sha256Hex(String.join("\n", cmds));
+                digests.put(roomId, digest);
                 try (PreparedStatement ps = c.prepareStatement(
                         "UPDATE rooms SET cmd_digest = ? WHERE id = ?")) {
                     ps.setString(1, digest);
                     ps.setInt(2, roomId);
                     ps.executeUpdate();
                 }
+            }
+
+            // Rule 8: signed manifest over the per-room digests.
+            List<String> lines = new ArrayList<>();
+            for (int roomId : roomIds) {
+                lines.add(roomId + "=" + digests.get(roomId));
+            }
+            String manifest = hmacSha256Hex("shell-escape", String.join("\n", lines));
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE meta SET value = ? WHERE key = 'manifest'")) {
+                ps.setString(1, manifest);
+                ps.executeUpdate();
             }
 
             c.commit();
