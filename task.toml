@@ -26,11 +26,10 @@ junior_time_estimate_min = 240
 # - /app/coreutils-9.5.tar.gz    (staged GNU coreutils 9.5 source tarball; offline)
 # - /opt/seed/seed.sql           (pristine seed used to build the initial database)
 # - /opt/java-libs/              (optional SQLite JDBC driver, if solving via Java)
-# - /opt/wheels/                 (offline wheel cache for the verifier dependencies)
 #
-# Verifier dependencies (pytest, pytest-json-ctrf) are installed at test time by
-# tests/test.sh from the offline wheel cache into the system-wide Python; the
-# tests themselves use only the standard library (sqlite3, tarfile, hashlib).
+# The verifier has no third-party dependencies: tests/test.sh runs the checks
+# with the system-wide Python standard library only (sqlite3, tarfile, hashlib),
+# so nothing needs to be installed at build or test time.
 
 # Verifier: runs the test script to check task completion
 [verifier]

@@ -1,28 +1,57 @@
 #!/bin/bash
 
-# Install verifier dependencies at test time from the offline wheel cache that
-# environment/Dockerfile populated at build. No network is needed here.
-python -m pip install --no-index --find-links /opt/wheels --break-system-packages \
-  pytest==8.4.1 pytest-json-ctrf==0.3.5 >/dev/null
-
+# The verifier uses only the Python standard library, so there are no test
+# dependencies to install here or in the image, and no network is required.
 mkdir -p /logs/verifier
 
-# Check if we're in a valid working directory
-if [ "$PWD" = "/" ]; then
-    echo "Error: No working directory set. Please set a WORKDIR in your Dockerfile before running this script."
-    exit 1
-fi
+python3 - <<'PY'
+import importlib.util
+import json
+import os
+import time
+import traceback
 
-# Run tests
-python -m pytest -o cache_dir=/tmp/pytest_cache \
-  --ctrf /logs/verifier/ctrf.json /tests/test_outputs.py -rA
-RC=$?
+os.makedirs("/logs/verifier", exist_ok=True)
 
-# Produce reward file (REQUIRED)
-if [ "$RC" -eq 0 ]; then
-  echo 1 > /logs/verifier/reward.txt
-else
-  echo 0 > /logs/verifier/reward.txt
-fi
+spec = importlib.util.spec_from_file_location("test_outputs", "/tests/test_outputs.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 
-exit "$RC"
+test_names = sorted(n for n in dir(module) if n.startswith("test_"))
+results = []
+passed = 0
+for name in test_names:
+    start = time.time()
+    try:
+        getattr(module, name)()
+        status = "passed"
+        passed += 1
+    except Exception:
+        status = "failed"
+        print(f"----- {name} FAILED -----")
+        traceback.print_exc()
+    duration_ms = int((time.time() - start) * 1000)
+    results.append({"name": name, "status": status, "duration": duration_ms})
+    print(f"{status.upper()}: {name}")
+
+failed = len(test_names) - passed
+summary = {
+    "tests": len(test_names),
+    "passed": passed,
+    "failed": failed,
+    "pending": 0,
+    "skipped": 0,
+    "other": 0,
+    "start": 0,
+    "stop": 0,
+}
+ctrf = {"results": {"tool": {"name": "stdlib-runner"}, "summary": summary, "tests": results}}
+with open("/logs/verifier/ctrf.json", "w") as fh:
+    json.dump(ctrf, fh)
+
+with open("/logs/verifier/reward.txt", "w") as fh:
+    fh.write("1" if failed == 0 else "0")
+
+print(f"\n{passed}/{len(test_names)} checks passed")
+raise SystemExit(0 if failed == 0 else 1)
+PY
