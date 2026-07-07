@@ -43,38 +43,162 @@ COREUTILS_9_5 = frozenset(
 
 
 def _canon(command: str) -> str:
-    """Canonical form: strip inline comment, collapse whitespace runs, trim."""
-    command = command.split("#", 1)[0]
-    return re.sub(r"\s+", " ", command).strip()
+    """Canonical form (quote-aware): strip an unquoted inline comment, collapse
+    runs of unquoted whitespace to one space, and trim unquoted ends. Quote
+    characters and the bytes inside quotes are preserved verbatim."""
+    res = []
+    in_single = in_double = False
+    pending_space = False
+    at_boundary = True  # start-of-string or after unquoted whitespace
+    for ch in command:
+        if in_single:
+            res.append(ch)
+            if ch == "'":
+                in_single = False
+            at_boundary = False
+            continue
+        if in_double:
+            res.append(ch)
+            if ch == '"':
+                in_double = False
+            at_boundary = False
+            continue
+        if ch in ("'", '"'):
+            if pending_space and res:
+                res.append(" ")
+            pending_space = False
+            if ch == "'":
+                in_single = True
+            else:
+                in_double = True
+            res.append(ch)
+            at_boundary = False
+            continue
+        if ch.isspace():
+            pending_space = True
+            at_boundary = True
+            continue
+        if ch == "#" and at_boundary:
+            break
+        if pending_space and res:
+            res.append(" ")
+        pending_space = False
+        res.append(ch)
+        at_boundary = False
+    return "".join(res)
+
+
+def _scan_split(s: str, is_sep):
+    """Split s on separator chars that are unquoted (quote-aware)."""
+    parts = []
+    cur = []
+    in_single = in_double = False
+    for ch in s:
+        if in_single:
+            cur.append(ch)
+            if ch == "'":
+                in_single = False
+            continue
+        if in_double:
+            cur.append(ch)
+            if ch == '"':
+                in_double = False
+            continue
+        if ch == "'":
+            in_single = True
+            cur.append(ch)
+            continue
+        if ch == '"':
+            in_double = True
+            cur.append(ch)
+            continue
+        if is_sep(ch):
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _unquote(token: str) -> str:
+    """Literal value of a token with its surrounding quotes removed."""
+    out = []
+    in_single = in_double = False
+    for ch in token:
+        if in_single:
+            if ch == "'":
+                in_single = False
+            else:
+                out.append(ch)
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            else:
+                out.append(ch)
+            continue
+        if ch == "'":
+            in_single = True
+            continue
+        if ch == '"':
+            in_double = True
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _has_glob(command: str) -> bool:
+    """True iff the command has an unquoted `*` or `?`."""
+    in_single = in_double = False
+    for ch in command:
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            continue
+        if ch == "'":
+            in_single = True
+            continue
+        if ch == '"':
+            in_double = True
+            continue
+        if ch in "*?":
+            return True
+    return False
 
 
 def _stage_program(stage: str):
     """Program of one pipeline stage, or None if the stage names no program."""
-    tokens = stage.split()
+    values = [_unquote(t) for t in _scan_split(stage, str.isspace) if t != ""]
     i = 0
-    while i < len(tokens) and ASSIGN.match(tokens[i]):
+    while i < len(values) and ASSIGN.match(values[i]):
         i += 1
-    if i >= len(tokens):
+    if i >= len(values):
         return None
-    prog = os.path.basename(tokens[i])
+    prog = os.path.basename(values[i])
     if prog == "env":
         i += 1
-        while i < len(tokens) and (tokens[i].startswith("-") or ASSIGN.match(tokens[i])):
+        while i < len(values) and (values[i].startswith("-") or ASSIGN.match(values[i])):
             i += 1
-        if i >= len(tokens):
+        if i >= len(values):
             return "env"
-        prog = os.path.basename(tokens[i])
+        prog = os.path.basename(values[i])
     return prog
 
 
 def _programs(command: str):
-    """All programs a (canonical) command runs, one per `|`-separated stage."""
-    return [_stage_program(stage) for stage in command.split("|")]
+    """All programs a (canonical) command runs, one per unquoted-`|` stage."""
+    return [_stage_program(stage) for stage in _scan_split(command, lambda c: c == "|")]
 
 
 def _is_safe(command: str, approved: set) -> bool:
-    """A canonical command is safe iff every stage program is vetted, no glob."""
-    if "*" in command or "?" in command:
+    """A canonical command is safe iff it has no unquoted glob and every stage
+    program is a vetted, non-denylisted coreutils utility."""
+    if _has_glob(command):
         return False
     for prog in _programs(command):
         if prog is None or prog not in approved or prog in DENYLIST:

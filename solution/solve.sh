@@ -45,17 +45,103 @@ import javax.crypto.spec.SecretKeySpec;
 public class Migrate {
 
     static final Pattern ASSIGN = Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*=");
-    static final Pattern WS = Pattern.compile("\\s+");
     static final Set<String> DENY =
             new HashSet<>(Arrays.asList("rm", "dd", "shred", "chroot", "runcon"));
     static Set<String> approved;
 
+    // Quote-aware canonical form: strip an unquoted inline comment, collapse
+    // runs of unquoted whitespace to a single space, trim unquoted ends.
     static String canon(String s) {
-        int hash = s.indexOf('#');
-        if (hash >= 0) {
-            s = s.substring(0, hash);
+        StringBuilder res = new StringBuilder();
+        boolean inS = false, inD = false, pend = false, boundary = true;
+        for (int k = 0; k < s.length(); k++) {
+            char ch = s.charAt(k);
+            if (inS) {
+                res.append(ch);
+                if (ch == '\'') inS = false;
+                boundary = false;
+                continue;
+            }
+            if (inD) {
+                res.append(ch);
+                if (ch == '"') inD = false;
+                boundary = false;
+                continue;
+            }
+            if (ch == '\'' || ch == '"') {
+                if (pend && res.length() > 0) res.append(' ');
+                pend = false;
+                if (ch == '\'') inS = true; else inD = true;
+                res.append(ch);
+                boundary = false;
+                continue;
+            }
+            if (Character.isWhitespace(ch)) {
+                pend = true;
+                boundary = true;
+                continue;
+            }
+            if (ch == '#' && boundary) break;
+            if (pend && res.length() > 0) res.append(' ');
+            pend = false;
+            res.append(ch);
+            boundary = false;
         }
-        return WS.matcher(s).replaceAll(" ").trim();
+        return res.toString();
+    }
+
+    // Split s on unquoted separators (whitespace when ws=true, else '|').
+    static List<String> scanSplit(String s, boolean ws) {
+        List<String> parts = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        boolean inS = false, inD = false;
+        for (int k = 0; k < s.length(); k++) {
+            char ch = s.charAt(k);
+            if (inS) {
+                cur.append(ch);
+                if (ch == '\'') inS = false;
+                continue;
+            }
+            if (inD) {
+                cur.append(ch);
+                if (ch == '"') inD = false;
+                continue;
+            }
+            if (ch == '\'') { inS = true; cur.append(ch); continue; }
+            if (ch == '"') { inD = true; cur.append(ch); continue; }
+            boolean sep = ws ? Character.isWhitespace(ch) : (ch == '|');
+            if (sep) { parts.add(cur.toString()); cur.setLength(0); continue; }
+            cur.append(ch);
+        }
+        parts.add(cur.toString());
+        return parts;
+    }
+
+    static String unquote(String t) {
+        StringBuilder o = new StringBuilder();
+        boolean inS = false, inD = false;
+        for (int k = 0; k < t.length(); k++) {
+            char ch = t.charAt(k);
+            if (inS) { if (ch == '\'') inS = false; else o.append(ch); continue; }
+            if (inD) { if (ch == '"') inD = false; else o.append(ch); continue; }
+            if (ch == '\'') { inS = true; continue; }
+            if (ch == '"') { inD = true; continue; }
+            o.append(ch);
+        }
+        return o.toString();
+    }
+
+    static boolean hasGlob(String s) {
+        boolean inS = false, inD = false;
+        for (int k = 0; k < s.length(); k++) {
+            char ch = s.charAt(k);
+            if (inS) { if (ch == '\'') inS = false; continue; }
+            if (inD) { if (ch == '"') inD = false; continue; }
+            if (ch == '\'') { inS = true; continue; }
+            if (ch == '"') { inD = true; continue; }
+            if (ch == '*' || ch == '?') return true;
+        }
+        return false;
     }
 
     static String basename(String t) {
@@ -64,35 +150,29 @@ public class Migrate {
     }
 
     static String stageProgram(String stage) {
-        String s = stage.trim();
-        String[] toks = s.isEmpty() ? new String[0] : s.split("\\s+");
+        List<String> values = new ArrayList<>();
+        for (String t : scanSplit(stage, true)) {
+            if (!t.isEmpty()) values.add(unquote(t));
+        }
         int i = 0;
-        while (i < toks.length && ASSIGN.matcher(toks[i]).find()) {
-            i++;
-        }
-        if (i >= toks.length) {
-            return null;
-        }
-        String prog = basename(toks[i]);
+        while (i < values.size() && ASSIGN.matcher(values.get(i)).find()) i++;
+        if (i >= values.size()) return null;
+        String prog = basename(values.get(i));
         if (prog.equals("env")) {
             i++;
-            while (i < toks.length
-                    && (toks[i].startsWith("-") || ASSIGN.matcher(toks[i]).find())) {
+            while (i < values.size()
+                    && (values.get(i).startsWith("-") || ASSIGN.matcher(values.get(i)).find())) {
                 i++;
             }
-            if (i >= toks.length) {
-                return "env";
-            }
-            prog = basename(toks[i]);
+            if (i >= values.size()) return "env";
+            prog = basename(values.get(i));
         }
         return prog;
     }
 
     static boolean isSafe(String command) {
-        if (command.indexOf('*') >= 0 || command.indexOf('?') >= 0) {
-            return false;
-        }
-        for (String stage : command.split("\\|", -1)) {
+        if (hasGlob(command)) return false;
+        for (String stage : scanSplit(command, false)) {
             String prog = stageProgram(stage);
             if (prog == null || !approved.contains(prog) || DENY.contains(prog)) {
                 return false;
@@ -103,9 +183,7 @@ public class Migrate {
 
     static String toHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder();
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
-        }
+        for (byte b : bytes) sb.append(String.format("%02x", b));
         return sb.toString();
     }
 
@@ -119,7 +197,6 @@ public class Migrate {
         return toHex(mac.doFinal(msg.getBytes("UTF-8")));
     }
 
-    // Canonicalize a text column in place (by primary key id).
     static void canonicalize(Connection c, String table, String col) throws Exception {
         Map<Integer, String> updates = new HashMap<>();
         try (Statement st = c.createStatement();
@@ -146,9 +223,7 @@ public class Migrate {
         approved = new HashSet<>();
         for (String line : Files.readAllLines(Paths.get(listFile))) {
             String t = line.trim();
-            if (!t.isEmpty()) {
-                approved.add(t);
-            }
+            if (!t.isEmpty()) approved.add(t);
         }
 
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
@@ -169,17 +244,12 @@ public class Migrate {
             try (Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery("SELECT id, command FROM allowed_commands")) {
                 while (rs.next()) {
-                    if (!isSafe(rs.getString(2))) {
-                        drop.add(rs.getInt(1));
-                    }
+                    if (!isSafe(rs.getString(2))) drop.add(rs.getInt(1));
                 }
             }
             try (PreparedStatement ps = c.prepareStatement(
                     "DELETE FROM allowed_commands WHERE id = ?")) {
-                for (int id : drop) {
-                    ps.setInt(1, id);
-                    ps.addBatch();
-                }
+                for (int id : drop) { ps.setInt(1, id); ps.addBatch(); }
                 ps.executeBatch();
             }
 
@@ -216,17 +286,13 @@ public class Migrate {
             while (!queue.isEmpty()) {
                 int u = queue.poll();
                 for (int v : adj.getOrDefault(u, Collections.emptyList())) {
-                    if (reachable.add(v)) {
-                        queue.add(v);
-                    }
+                    if (reachable.add(v)) queue.add(v);
                 }
             }
             List<Integer> roomIds = new ArrayList<>();
             try (Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery("SELECT id FROM rooms ORDER BY id")) {
-                while (rs.next()) {
-                    roomIds.add(rs.getInt(1));
-                }
+                while (rs.next()) roomIds.add(rs.getInt(1));
             }
             try (PreparedStatement ps = c.prepareStatement(
                     "UPDATE rooms SET is_locked = ? WHERE id = ?")) {
@@ -246,9 +312,7 @@ public class Migrate {
                         "SELECT command FROM allowed_commands WHERE room_id = ?")) {
                     ps.setInt(1, roomId);
                     try (ResultSet rs = ps.executeQuery()) {
-                        while (rs.next()) {
-                            cmds.add(rs.getString(1));
-                        }
+                        while (rs.next()) cmds.add(rs.getString(1));
                     }
                 }
                 Collections.sort(cmds);
