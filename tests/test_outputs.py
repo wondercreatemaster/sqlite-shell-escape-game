@@ -178,17 +178,15 @@ def _canonical(con: sqlite3.Connection) -> str:
     ):
         parts.append("R|" + "|".join(str(x) for x in row))
     for row in cur.execute(
-        "SELECT room_id, command FROM allowed_commands ORDER BY room_id, command"
+        "SELECT id, room_id, command FROM allowed_commands ORDER BY id"
     ):
         parts.append("A|" + "|".join(str(x) for x in row))
     for row in cur.execute(
-        "SELECT room_id, expected_command, points FROM challenge_checks "
-        "ORDER BY room_id, expected_command, points"
+        "SELECT id, room_id, expected_command, points FROM challenge_checks ORDER BY id"
     ):
         parts.append("C|" + "|".join(str(x) for x in row))
     for row in cur.execute(
-        "SELECT from_room, to_room, via_command FROM doors "
-        "ORDER BY from_room, to_room, via_command"
+        "SELECT id, from_room, to_room, via_command FROM doors ORDER BY id"
     ):
         parts.append("D|" + "|".join(str(x) for x in row))
     for row in cur.execute("SELECT key, value FROM meta ORDER BY key"):
@@ -357,6 +355,24 @@ def test_manifest_hmac():
         )
     finally:
         con.close()
+
+
+def test_row_ids_preserved():
+    """Rows are not renumbered: surviving rows keep their original seed ids."""
+    reference = _build_reference()
+    con = _open_agent_db()
+    try:
+        for table in ("allowed_commands", "challenge_checks", "doors"):
+            expected_ids = sorted(
+                r[0] for r in reference.execute(f"SELECT id FROM {table}")
+            )
+            actual_ids = sorted(r[0] for r in con.execute(f"SELECT id FROM {table}"))
+            assert actual_ids == expected_ids, (
+                f"{table} ids were renumbered: expected {expected_ids}, got {actual_ids}"
+            )
+    finally:
+        con.close()
+        reference.close()
 
 
 def test_canonical_state_matches_expected():
