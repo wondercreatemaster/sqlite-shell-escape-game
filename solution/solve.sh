@@ -52,6 +52,8 @@ public class Migrate {
             new HashSet<>(Arrays.asList("rm", "dd", "shred", "chroot", "runcon"));
     static Set<String> approved;
     static String hmacKey;
+    static int digestRounds;
+    static final String B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
     // Quote/escape-aware canonical form: strip an unquoted, unescaped inline
     // comment, collapse runs of unquoted, unescaped whitespace to a single
@@ -201,14 +203,42 @@ public class Migrate {
         return sb.toString();
     }
 
-    static String sha256Hex(String s) throws Exception {
-        return toHex(MessageDigest.getInstance("SHA-256").digest(s.getBytes("UTF-8")));
+    // R-times-iterated SHA-256 with raw-byte chaining; lowercase hex of final bytes.
+    static String iteratedDigestHex(String s, int rounds) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] h = s.getBytes("UTF-8");
+        for (int r = 0; r < rounds; r++) {
+            md.reset();
+            h = md.digest(h);
+        }
+        return toHex(h);
     }
 
-    static String hmacSha256Hex(String key, String msg) throws Exception {
+    static byte[] hmacSha256Raw(String key, String msg) throws Exception {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key.getBytes("UTF-8"), "HmacSHA256"));
-        return toHex(mac.doFinal(msg.getBytes("UTF-8")));
+        return mac.doFinal(msg.getBytes("UTF-8"));
+    }
+
+    // RFC 4648 Base32 (uppercase A-Z2-7, '=' padding to a multiple of 8 chars).
+    static String base32(byte[] data) {
+        StringBuilder sb = new StringBuilder();
+        int buffer = 0, bits = 0;
+        for (byte b : data) {
+            buffer = (buffer << 8) | (b & 0xff);
+            bits += 8;
+            while (bits >= 5) {
+                sb.append(B32.charAt((buffer >>> (bits - 5)) & 0x1f));
+                bits -= 5;
+            }
+        }
+        if (bits > 0) {
+            sb.append(B32.charAt((buffer << (5 - bits)) & 0x1f));
+        }
+        while (sb.length() % 8 != 0) {
+            sb.append('=');
+        }
+        return sb.toString();
     }
 
     static void canonicalize(Connection c, String table, String col) throws Exception {
@@ -247,7 +277,7 @@ public class Migrate {
                 || policy[2] != 'S' || policy[3] != 'C') {
             throw new IllegalStateException("bad policy magic");
         }
-        if ((policy[4] & 0xff) != 1) {
+        if ((policy[4] & 0xff) != 2) {
             throw new IllegalStateException("bad policy version");
         }
         CRC32 crc = new CRC32();
@@ -258,6 +288,7 @@ public class Migrate {
             throw new IllegalStateException("policy CRC mismatch");
         }
         bb.position(5);
+        digestRounds = bb.getShort() & 0xffff;
         int keyLen = bb.getShort() & 0xffff;
         byte[] keyBytes = new byte[keyLen];
         bb.get(keyBytes);
@@ -381,7 +412,7 @@ public class Migrate {
                     }
                 }
                 Collections.sort(cmds);
-                String digest = sha256Hex(String.join("\n", cmds));
+                String digest = iteratedDigestHex(String.join("\n", cmds), digestRounds);
                 digests.put(roomId, digest);
                 try (PreparedStatement ps = c.prepareStatement(
                         "UPDATE rooms SET cmd_digest = ? WHERE id = ?")) {
@@ -396,7 +427,7 @@ public class Migrate {
             for (int roomId : roomIds) {
                 lines.add(roomId + "=" + digests.get(roomId));
             }
-            String manifest = hmacSha256Hex(hmacKey, String.join("\n", lines));
+            String manifest = base32(hmacSha256Raw(hmacKey, String.join("\n", lines)));
             try (PreparedStatement ps = c.prepareStatement(
                     "UPDATE meta SET value = ? WHERE key = 'manifest'")) {
                 ps.setString(1, manifest);

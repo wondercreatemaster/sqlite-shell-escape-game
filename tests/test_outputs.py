@@ -9,6 +9,7 @@ The verifier deliberately does NOT read any agent-writable file (e.g.
 state, so an agent cannot move the goalposts by tampering with those inputs.
 """
 
+import base64
 import hashlib
 import hmac
 import os
@@ -30,11 +31,13 @@ ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _parse_policy(path: str):
-    """Parse the big-endian policy blob -> (hmac_key_bytes, extra_denylist_set)."""
+    """Parse the big-endian policy v2 blob -> (rounds, hmac_key_bytes, extra_deny)."""
     blob = Path(path).read_bytes()
     assert blob[0:4] == b"SESC", "bad policy magic"
-    assert blob[4] == 1, "bad policy version"
+    assert blob[4] == 2, "bad policy version"
     off = 5
+    (rounds,) = struct.unpack_from(">H", blob, off)
+    off += 2
     (key_len,) = struct.unpack_from(">H", blob, off)
     off += 2
     key = blob[off:off + key_len]
@@ -49,10 +52,10 @@ def _parse_policy(path: str):
         off += nlen
     (crc,) = struct.unpack_from(">I", blob, off)
     assert zlib.crc32(blob[: len(blob) - 4]) & 0xFFFFFFFF == crc, "policy CRC mismatch"
-    return key, extra
+    return rounds, key, extra
 
 
-HMAC_KEY, _EXTRA_DENY = _parse_policy(POLICY_PATH)
+DIGEST_ROUNDS, HMAC_KEY, _EXTRA_DENY = _parse_policy(POLICY_PATH)
 DENYLIST = BASE_DENYLIST | _EXTRA_DENY
 
 # The programs shipped by GNU coreutils 9.5 (the trusted allowlist). This is the
@@ -317,8 +320,18 @@ def _is_safe(command: str, approved: set) -> bool:
     return True
 
 
-def _sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _digest(text: str) -> str:
+    """R-times-iterated SHA-256 (raw-byte chaining), lowercase hex of final digest."""
+    h = text.encode("utf-8")
+    for _ in range(DIGEST_ROUNDS):
+        h = hashlib.sha256(h).digest()
+    return h.hex()
+
+
+def _manifest(message: str) -> str:
+    """RFC 4648 Base32 (uppercase, padded) of the raw HMAC-SHA256 digest bytes."""
+    raw = hmac.new(HMAC_KEY, message.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b32encode(raw).decode("ascii")
 
 
 def _build_reference() -> sqlite3.Connection:
@@ -399,14 +412,13 @@ def _build_reference() -> sqlite3.Connection:
                 "SELECT command FROM allowed_commands WHERE room_id = ?", (room_id,)
             ).fetchall()
         ]
-        digest = _sha256_hex("\n".join(sorted(cmds)))
+        digest = _digest("\n".join(sorted(cmds)))
         digests[room_id] = digest
         cur.execute("UPDATE rooms SET cmd_digest = ? WHERE id = ?", (digest, room_id))
 
-    # Rule 9: signed manifest.
+    # Rule 9: signed manifest (Base32 of raw HMAC bytes).
     message = "\n".join(f"{room_id}={digests[room_id]}" for room_id in room_ids)
-    manifest = hmac.new(HMAC_KEY, message.encode("utf-8"), hashlib.sha256).hexdigest()
-    cur.execute("UPDATE meta SET value = ? WHERE key = 'manifest'", (manifest,))
+    cur.execute("UPDATE meta SET value = ? WHERE key = 'manifest'", (_manifest(message),))
 
     con.commit()
     return con
@@ -563,7 +575,7 @@ def test_reachability_lock_state():
 
 
 def test_cmd_digests_recomputed():
-    """Rule 8: each room's cmd_digest is SHA-256 of its sorted surviving commands."""
+    """Rule 8: each room's cmd_digest is the R-round iterated SHA-256 of its commands."""
     con = _open_agent_db()
     try:
         for room_id, in con.execute("SELECT id FROM rooms ORDER BY id"):
@@ -573,7 +585,7 @@ def test_cmd_digests_recomputed():
                     "SELECT command FROM allowed_commands WHERE room_id = ?", (room_id,)
                 ).fetchall()
             ]
-            expected = _sha256_hex("\n".join(sorted(cmds)))
+            expected = _digest("\n".join(sorted(cmds)))
             (actual,) = con.execute(
                 "SELECT cmd_digest FROM rooms WHERE id = ?", (room_id,)
             ).fetchone()
@@ -585,12 +597,12 @@ def test_cmd_digests_recomputed():
 
 
 def test_manifest_hmac():
-    """Rule 9: meta.manifest is the HMAC-SHA256 over the per-room digest lines."""
+    """Rule 9: meta.manifest is the Base32 of the HMAC-SHA256 over per-room digest lines."""
     con = _open_agent_db()
     try:
         rows = con.execute("SELECT id, cmd_digest FROM rooms ORDER BY id").fetchall()
         message = "\n".join(f"{room_id}={digest}" for room_id, digest in rows)
-        expected = hmac.new(HMAC_KEY, message.encode("utf-8"), hashlib.sha256).hexdigest()
+        expected = _manifest(message)
         (actual,) = con.execute(
             "SELECT value FROM meta WHERE key = 'manifest'"
         ).fetchone()
