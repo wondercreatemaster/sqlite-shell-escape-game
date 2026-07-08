@@ -567,8 +567,7 @@ def test_reachability_lock_state():
         for room_id, locked in con.execute("SELECT id, is_locked FROM rooms ORDER BY id"):
             expected = 0 if room_id in reachable else 1
             assert locked == expected, (
-                f"Room {room_id} is_locked={locked}, expected {expected} "
-                f"(reachable={sorted(reachable)})"
+                f"Room {room_id} has the wrong is_locked value ({locked})"
             )
     finally:
         con.close()
@@ -590,7 +589,7 @@ def test_cmd_digests_recomputed():
                 "SELECT cmd_digest FROM rooms WHERE id = ?", (room_id,)
             ).fetchone()
             assert actual == expected, (
-                f"Room {room_id} cmd_digest mismatch: expected {expected}, got {actual}"
+                f"Room {room_id} cmd_digest is incorrect (got {actual})"
             )
     finally:
         con.close()
@@ -606,9 +605,7 @@ def test_manifest_hmac():
         (actual,) = con.execute(
             "SELECT value FROM meta WHERE key = 'manifest'"
         ).fetchone()
-        assert actual == expected, (
-            f"manifest mismatch: expected {expected}, got {actual}"
-        )
+        assert actual == expected, f"manifest is incorrect (got {actual})"
     finally:
         con.close()
 
@@ -621,8 +618,7 @@ def test_points_recomputed():
             "SELECT room_id, expected_command, points FROM challenge_checks"
         ):
             assert points == _points(expected_command), (
-                f"Room {room_id} challenge {expected_command!r}: points={points}, "
-                f"expected {_points(expected_command)}"
+                f"Room {room_id} challenge {expected_command!r} has wrong points ({points})"
             )
     finally:
         con.close()
@@ -684,9 +680,8 @@ def test_no_extra_or_missing_rows():
         for table in ("rooms", "allowed_commands", "challenge_checks", "doors", "meta"):
             expected = reference.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             actual = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            assert actual == expected, (
-                f"{table} has {actual} rows, expected {expected}"
-            )
+            # Do not print the expected count (it reveals how many rows survive).
+            assert actual == expected, f"{table} has an unexpected row count ({actual})"
     finally:
         con.close()
         reference.close()
@@ -702,8 +697,9 @@ def test_row_ids_preserved():
                 r[0] for r in reference.execute(f"SELECT id FROM {table}")
             )
             actual_ids = sorted(r[0] for r in con.execute(f"SELECT id FROM {table}"))
+            # Do not print the expected id set (it reveals which rows survive).
             assert actual_ids == expected_ids, (
-                f"{table} ids were renumbered: expected {expected_ids}, got {actual_ids}"
+                f"{table} ids do not match the expected set (got {actual_ids})"
             )
     finally:
         con.close()
@@ -717,12 +713,13 @@ def test_canonical_state_matches_expected():
     try:
         expected = _checksum(reference)
         actual = _checksum(con)
+        # NOTE: deliberately do NOT emit the expected reference state or checksum
+        # here -- run logs (e.g. harbor's jobs/) capture verifier stdout, and
+        # leaking the target would let an agent copy it instead of solving. Report
+        # only the agent's own state to aid debugging without revealing the answer.
         assert actual == expected, (
-            "Canonical hardened state mismatch.\n"
-            f"expected checksum: {expected}\n"
-            f"actual checksum:   {actual}\n\n"
-            f"expected:\n{_canonical(reference)}\n\n"
-            f"actual:\n{_canonical(con)}"
+            "Canonical hardened state does not match the expected reference.\n"
+            f"actual (agent) canonical state:\n{_canonical(con)}"
         )
     finally:
         con.close()

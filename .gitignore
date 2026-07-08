@@ -1,0 +1,15 @@
+# Harbor / harness run artifacts — MUST NOT be committed or included in the
+# submission zip: their logs capture verifier output and could leak expected
+# values to the agent.
+jobs/
+runs/
+logs/
+*.log
+.harbor/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local scratch
+work/
