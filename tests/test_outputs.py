@@ -493,7 +493,7 @@ def test_no_orphan_challenges():
 
 
 def test_doors_are_usable():
-    """Rule 5: every surviving door's via_command survives in its from_room."""
+    """Rule 6: every surviving door's via_command survives in its from_room."""
     con = _open_agent_db()
     try:
         bad = con.execute(
@@ -507,7 +507,7 @@ def test_doors_are_usable():
 
 
 def test_reachability_lock_state():
-    """Rule 6: is_locked=0 iff the room is reachable from room 1 via surviving doors."""
+    """Rule 7: is_locked=0 iff the room is reachable from room 1 via surviving doors."""
     con = _open_agent_db()
     try:
         adj = {}
@@ -532,7 +532,7 @@ def test_reachability_lock_state():
 
 
 def test_cmd_digests_recomputed():
-    """Rule 7: each room's cmd_digest is SHA-256 of its sorted surviving commands."""
+    """Rule 8: each room's cmd_digest is SHA-256 of its sorted surviving commands."""
     con = _open_agent_db()
     try:
         for room_id, in con.execute("SELECT id FROM rooms ORDER BY id"):
@@ -554,7 +554,7 @@ def test_cmd_digests_recomputed():
 
 
 def test_manifest_hmac():
-    """Rule 8: meta.manifest is the HMAC-SHA256 over the per-room digest lines."""
+    """Rule 9: meta.manifest is the HMAC-SHA256 over the per-room digest lines."""
     con = _open_agent_db()
     try:
         rows = con.execute("SELECT id, cmd_digest FROM rooms ORDER BY id").fetchall()
