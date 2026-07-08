@@ -14,15 +14,46 @@ import hmac
 import os
 import re
 import sqlite3
+import struct
+import zlib
 from collections import deque
 from pathlib import Path
 
 DB_PATH = "/app/game/escape.db"
 SEED_PATH = str(Path(__file__).resolve().parent / "seed_reference.sql")
+# Trusted copy of the binary policy the verifier carries (never the agent's copy
+# at /app/game/policy.bin), so the derived key/denylist cannot be tampered with.
+POLICY_PATH = str(Path(__file__).resolve().parent / "policy.bin")
 
-DENYLIST = {"rm", "dd", "shred", "chroot", "runcon"}
-HMAC_KEY = b"shell-escape"
+BASE_DENYLIST = {"rm", "dd", "shred", "chroot", "runcon"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _parse_policy(path: str):
+    """Parse the big-endian policy blob -> (hmac_key_bytes, extra_denylist_set)."""
+    blob = Path(path).read_bytes()
+    assert blob[0:4] == b"SESC", "bad policy magic"
+    assert blob[4] == 1, "bad policy version"
+    off = 5
+    (key_len,) = struct.unpack_from(">H", blob, off)
+    off += 2
+    key = blob[off:off + key_len]
+    off += key_len
+    (count,) = struct.unpack_from(">H", blob, off)
+    off += 2
+    extra = set()
+    for _ in range(count):
+        nlen = blob[off]
+        off += 1
+        extra.add(blob[off:off + nlen].decode("ascii"))
+        off += nlen
+    (crc,) = struct.unpack_from(">I", blob, off)
+    assert zlib.crc32(blob[: len(blob) - 4]) & 0xFFFFFFFF == crc, "policy CRC mismatch"
+    return key, extra
+
+
+HMAC_KEY, _EXTRA_DENY = _parse_policy(POLICY_PATH)
+DENYLIST = BASE_DENYLIST | _EXTRA_DENY
 
 # The programs shipped by GNU coreutils 9.5 (the trusted allowlist). This is the
 # same set the agent is expected to extract from the staged tarball's README; we
@@ -596,13 +627,14 @@ def test_lexer_edge_cases():
             "echo \\*",      # escaped glob -> literal
             "echo 'a|b'",    # quoted pipe -> single stage
             "echo a\\ b",    # escaped space -> single argument
-            "tr a\\|b x",    # escaped pipe -> single stage, program tr
         ]
         for cmd in must_keep:
             assert cmd in commands, f"safe command should survive: {cmd!r}"
         must_drop = [
             "ls *",                  # unquoted glob
             "cat data | grep flag",  # non-coreutils stage
+            "tr a\\|b x",            # program tr is denylisted by the policy blob
+            "tac file | tee out",    # program tee is denylisted by the policy blob
         ]
         for cmd in must_drop:
             assert cmd not in commands, f"unsafe command should be removed: {cmd!r}"

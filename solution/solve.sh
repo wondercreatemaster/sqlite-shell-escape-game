@@ -21,6 +21,8 @@ awk '
 
 # 2) Apply the hardening rules to the SQLite database via a Java (JDBC) migration.
 cat > "$WORK/Migrate.java" <<'JAVA'
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.security.MessageDigest;
@@ -39,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.zip.CRC32;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -48,6 +51,7 @@ public class Migrate {
     static final Set<String> DENY =
             new HashSet<>(Arrays.asList("rm", "dd", "shred", "chroot", "runcon"));
     static Set<String> approved;
+    static String hmacKey;
 
     // Quote/escape-aware canonical form: strip an unquoted, unescaped inline
     // comment, collapse runs of unquoted, unescaped whitespace to a single
@@ -236,6 +240,36 @@ public class Migrate {
             if (!t.isEmpty()) approved.add(t);
         }
 
+        // Parse the binary policy blob: verify magic/version/CRC-32, then pull
+        // out the HMAC key and the extra denylist entries.
+        byte[] policy = Files.readAllBytes(Paths.get("/app/game/policy.bin"));
+        if (policy.length < 9 || policy[0] != 'S' || policy[1] != 'E'
+                || policy[2] != 'S' || policy[3] != 'C') {
+            throw new IllegalStateException("bad policy magic");
+        }
+        if ((policy[4] & 0xff) != 1) {
+            throw new IllegalStateException("bad policy version");
+        }
+        CRC32 crc = new CRC32();
+        crc.update(policy, 0, policy.length - 4);
+        ByteBuffer bb = ByteBuffer.wrap(policy).order(ByteOrder.BIG_ENDIAN);
+        long storedCrc = ((long) bb.getInt(policy.length - 4)) & 0xffffffffL;
+        if (crc.getValue() != storedCrc) {
+            throw new IllegalStateException("policy CRC mismatch");
+        }
+        bb.position(5);
+        int keyLen = bb.getShort() & 0xffff;
+        byte[] keyBytes = new byte[keyLen];
+        bb.get(keyBytes);
+        hmacKey = new String(keyBytes, "UTF-8");
+        int denyCount = bb.getShort() & 0xffff;
+        for (int j = 0; j < denyCount; j++) {
+            int nlen = bb.get() & 0xff;
+            byte[] nm = new byte[nlen];
+            bb.get(nm);
+            DENY.add(new String(nm, "UTF-8"));
+        }
+
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
             c.setAutoCommit(false);
 
@@ -362,7 +396,7 @@ public class Migrate {
             for (int roomId : roomIds) {
                 lines.add(roomId + "=" + digests.get(roomId));
             }
-            String manifest = hmacSha256Hex("shell-escape", String.join("\n", lines));
+            String manifest = hmacSha256Hex(hmacKey, String.join("\n", lines));
             try (PreparedStatement ps = c.prepareStatement(
                     "UPDATE meta SET value = ? WHERE key = 'manifest'")) {
                 ps.setString(1, manifest);

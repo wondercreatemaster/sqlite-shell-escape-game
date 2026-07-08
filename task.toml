@@ -23,10 +23,12 @@ junior_time_estimate_min = 240
 
 # Files referenced by the task and its verifier:
 # - /app/game/escape.db          (SQLite database that must be hardened in place)
+# - /app/game/policy.bin         (binary policy blob the migration must parse)
 # - /app/coreutils-9.5.tar.gz    (staged GNU coreutils 9.5 source tarball; offline)
 # - /opt/seed/seed.sql           (build-time only: used to create the initial DB)
 # - /opt/java-libs/              (optional SQLite JDBC driver, if solving via Java)
 # - tests/seed_reference.sql     (verifier-only trusted copy of the pristine seed)
+# - tests/policy.bin             (verifier-only trusted copy of the policy blob)
 #
 # Anti-tamper: the verifier derives the expected hardened state solely from
 # trusted inputs it carries (tests/seed_reference.sql and an embedded coreutils

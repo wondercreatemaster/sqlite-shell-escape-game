@@ -28,4 +28,7 @@ RUN wget -q -O /app/coreutils-9.5.tar.gz \
 COPY seed.sql /opt/seed/seed.sql
 RUN sqlite3 /app/game/escape.db < /opt/seed/seed.sql
 
+# Stage the binary policy blob the migration must parse (magic/version/CRC32).
+COPY policy.bin /app/game/policy.bin
+
 WORKDIR /app
