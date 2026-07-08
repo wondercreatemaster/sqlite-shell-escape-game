@@ -49,69 +49,74 @@ public class Migrate {
             new HashSet<>(Arrays.asList("rm", "dd", "shred", "chroot", "runcon"));
     static Set<String> approved;
 
-    // Quote-aware canonical form: strip an unquoted inline comment, collapse
-    // runs of unquoted whitespace to a single space, trim unquoted ends.
+    // Quote/escape-aware canonical form: strip an unquoted, unescaped inline
+    // comment, collapse runs of unquoted, unescaped whitespace to a single
+    // space, trim such ends. Quotes/escapes and protected bytes are kept.
     static String canon(String s) {
         StringBuilder res = new StringBuilder();
+        int n = s.length(), i = 0;
         boolean inS = false, inD = false, pend = false, boundary = true;
-        for (int k = 0; k < s.length(); k++) {
-            char ch = s.charAt(k);
+        while (i < n) {
+            char ch = s.charAt(i);
             if (inS) {
                 res.append(ch);
                 if (ch == '\'') inS = false;
-                boundary = false;
-                continue;
+                boundary = false; i++; continue;
             }
             if (inD) {
                 res.append(ch);
                 if (ch == '"') inD = false;
-                boundary = false;
-                continue;
+                boundary = false; i++; continue;
+            }
+            if (ch == '\\') {
+                if (pend && res.length() > 0) res.append(' ');
+                pend = false;
+                if (i + 1 < n) { res.append('\\'); res.append(s.charAt(i + 1)); i += 2; }
+                else { res.append('\\'); i++; }
+                boundary = false; continue;
             }
             if (ch == '\'' || ch == '"') {
                 if (pend && res.length() > 0) res.append(' ');
                 pend = false;
                 if (ch == '\'') inS = true; else inD = true;
-                res.append(ch);
-                boundary = false;
-                continue;
+                res.append(ch); boundary = false; i++; continue;
             }
-            if (Character.isWhitespace(ch)) {
-                pend = true;
-                boundary = true;
-                continue;
-            }
+            if (Character.isWhitespace(ch)) { pend = true; boundary = true; i++; continue; }
             if (ch == '#' && boundary) break;
             if (pend && res.length() > 0) res.append(' ');
-            pend = false;
-            res.append(ch);
-            boundary = false;
+            pend = false; res.append(ch); boundary = false; i++;
         }
         return res.toString();
     }
 
-    // Split s on unquoted separators (whitespace when ws=true, else '|').
+    // Split s on unquoted, unescaped separators (whitespace when ws=true, else '|').
     static List<String> scanSplit(String s, boolean ws) {
         List<String> parts = new ArrayList<>();
         StringBuilder cur = new StringBuilder();
+        int n = s.length(), i = 0;
         boolean inS = false, inD = false;
-        for (int k = 0; k < s.length(); k++) {
-            char ch = s.charAt(k);
+        while (i < n) {
+            char ch = s.charAt(i);
             if (inS) {
                 cur.append(ch);
                 if (ch == '\'') inS = false;
-                continue;
+                i++; continue;
             }
             if (inD) {
                 cur.append(ch);
                 if (ch == '"') inD = false;
+                i++; continue;
+            }
+            if (ch == '\\') {
+                if (i + 1 < n) { cur.append('\\'); cur.append(s.charAt(i + 1)); i += 2; }
+                else { cur.append('\\'); i++; }
                 continue;
             }
-            if (ch == '\'') { inS = true; cur.append(ch); continue; }
-            if (ch == '"') { inD = true; cur.append(ch); continue; }
+            if (ch == '\'') { inS = true; cur.append(ch); i++; continue; }
+            if (ch == '"') { inD = true; cur.append(ch); i++; continue; }
             boolean sep = ws ? Character.isWhitespace(ch) : (ch == '|');
-            if (sep) { parts.add(cur.toString()); cur.setLength(0); continue; }
-            cur.append(ch);
+            if (sep) { parts.add(cur.toString()); cur.setLength(0); i++; continue; }
+            cur.append(ch); i++;
         }
         parts.add(cur.toString());
         return parts;
@@ -119,27 +124,32 @@ public class Migrate {
 
     static String unquote(String t) {
         StringBuilder o = new StringBuilder();
+        int n = t.length(), i = 0;
         boolean inS = false, inD = false;
-        for (int k = 0; k < t.length(); k++) {
-            char ch = t.charAt(k);
-            if (inS) { if (ch == '\'') inS = false; else o.append(ch); continue; }
-            if (inD) { if (ch == '"') inD = false; else o.append(ch); continue; }
-            if (ch == '\'') { inS = true; continue; }
-            if (ch == '"') { inD = true; continue; }
-            o.append(ch);
+        while (i < n) {
+            char ch = t.charAt(i);
+            if (inS) { if (ch == '\'') inS = false; else o.append(ch); i++; continue; }
+            if (inD) { if (ch == '"') inD = false; else o.append(ch); i++; continue; }
+            if (ch == '\\') { if (i + 1 < n) { o.append(t.charAt(i + 1)); i += 2; } else i++; continue; }
+            if (ch == '\'') { inS = true; i++; continue; }
+            if (ch == '"') { inD = true; i++; continue; }
+            o.append(ch); i++;
         }
         return o.toString();
     }
 
     static boolean hasGlob(String s) {
+        int n = s.length(), i = 0;
         boolean inS = false, inD = false;
-        for (int k = 0; k < s.length(); k++) {
-            char ch = s.charAt(k);
-            if (inS) { if (ch == '\'') inS = false; continue; }
-            if (inD) { if (ch == '"') inD = false; continue; }
-            if (ch == '\'') { inS = true; continue; }
-            if (ch == '"') { inD = true; continue; }
+        while (i < n) {
+            char ch = s.charAt(i);
+            if (inS) { if (ch == '\'') inS = false; i++; continue; }
+            if (inD) { if (ch == '"') inD = false; i++; continue; }
+            if (ch == '\\') { i += (i + 1 < n) ? 2 : 1; continue; }
+            if (ch == '\'') { inS = true; i++; continue; }
+            if (ch == '"') { inD = true; i++; continue; }
             if (ch == '*' || ch == '?') return true;
+            i++;
         }
         return false;
     }
@@ -262,7 +272,28 @@ public class Migrate {
                     + "AND a.command = challenge_checks.expected_command)");
             }
 
-            // Rule 5: delete non-usable doors.
+            // Rule 5: recompute points for surviving challenge_checks.
+            Map<Integer, Integer> pointUpdates = new HashMap<>();
+            try (Statement st = c.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT id, expected_command FROM challenge_checks")) {
+                while (rs.next()) {
+                    String cmd = rs.getString(2);
+                    int pts = 7 * scanSplit(cmd, false).size() + cmd.length();
+                    pointUpdates.put(rs.getInt(1), pts);
+                }
+            }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE challenge_checks SET points = ? WHERE id = ?")) {
+                for (Map.Entry<Integer, Integer> e : pointUpdates.entrySet()) {
+                    ps.setInt(1, e.getValue());
+                    ps.setInt(2, e.getKey());
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+
+            // Rule 6: delete non-usable doors.
             try (Statement st = c.createStatement()) {
                 st.executeUpdate(
                     "DELETE FROM doors WHERE NOT EXISTS ("
@@ -271,7 +302,7 @@ public class Migrate {
                     + "AND a.command = doors.via_command)");
             }
 
-            // Rule 6: reachability from room 1 over surviving doors.
+            // Rule 7: reachability from room 1 over surviving doors.
             Map<Integer, List<Integer>> adj = new HashMap<>();
             try (Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery("SELECT from_room, to_room FROM doors")) {
@@ -304,7 +335,7 @@ public class Migrate {
                 ps.executeBatch();
             }
 
-            // Rule 7: per-room cmd_digest over surviving commands.
+            // Rule 8: per-room cmd_digest over surviving commands.
             Map<Integer, String> digests = new HashMap<>();
             for (int roomId : roomIds) {
                 List<String> cmds = new ArrayList<>();
@@ -326,7 +357,7 @@ public class Migrate {
                 }
             }
 
-            // Rule 8: signed manifest over the per-room digests.
+            // Rule 9: signed manifest over the per-room digests.
             List<String> lines = new ArrayList<>();
             for (int roomId : roomIds) {
                 lines.add(roomId + "=" + digests.get(roomId));

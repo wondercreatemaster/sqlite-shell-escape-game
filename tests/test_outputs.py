@@ -43,132 +43,207 @@ COREUTILS_9_5 = frozenset(
 
 
 def _canon(command: str) -> str:
-    """Canonical form (quote-aware): strip an unquoted inline comment, collapse
-    runs of unquoted whitespace to one space, and trim unquoted ends. Quote
-    characters and the bytes inside quotes are preserved verbatim."""
+    """Canonical form (quote/escape-aware): strip an unquoted, unescaped inline
+    comment, collapse runs of unquoted, unescaped whitespace to one space, and
+    trim such ends. Quotes, escape backslashes, and protected bytes are kept."""
     res = []
+    i = 0
+    n = len(command)
     in_single = in_double = False
     pending_space = False
     at_boundary = True  # start-of-string or after unquoted whitespace
-    for ch in command:
+
+    def flush():
+        nonlocal pending_space
+        if pending_space and res:
+            res.append(" ")
+        pending_space = False
+
+    while i < n:
+        ch = command[i]
         if in_single:
             res.append(ch)
             if ch == "'":
                 in_single = False
             at_boundary = False
+            i += 1
             continue
         if in_double:
             res.append(ch)
             if ch == '"':
                 in_double = False
             at_boundary = False
+            i += 1
             continue
-        if ch in ("'", '"'):
-            if pending_space and res:
-                res.append(" ")
-            pending_space = False
-            if ch == "'":
-                in_single = True
+        if ch == "\\":
+            flush()
+            if i + 1 < n:
+                res.append("\\")
+                res.append(command[i + 1])
+                i += 2
             else:
-                in_double = True
+                res.append("\\")
+                i += 1
+            at_boundary = False
+            continue
+        if ch == "'":
+            flush()
+            in_single = True
             res.append(ch)
             at_boundary = False
+            i += 1
+            continue
+        if ch == '"':
+            flush()
+            in_double = True
+            res.append(ch)
+            at_boundary = False
+            i += 1
             continue
         if ch.isspace():
             pending_space = True
             at_boundary = True
+            i += 1
             continue
         if ch == "#" and at_boundary:
             break
-        if pending_space and res:
-            res.append(" ")
-        pending_space = False
+        flush()
         res.append(ch)
         at_boundary = False
+        i += 1
     return "".join(res)
 
 
 def _scan_split(s: str, is_sep):
-    """Split s on separator chars that are unquoted (quote-aware)."""
+    """Split s on unquoted, unescaped separator chars (quote/escape-aware)."""
     parts = []
     cur = []
+    i = 0
+    n = len(s)
     in_single = in_double = False
-    for ch in s:
+    while i < n:
+        ch = s[i]
         if in_single:
             cur.append(ch)
             if ch == "'":
                 in_single = False
+            i += 1
             continue
         if in_double:
             cur.append(ch)
             if ch == '"':
                 in_double = False
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 < n:
+                cur.append("\\")
+                cur.append(s[i + 1])
+                i += 2
+            else:
+                cur.append("\\")
+                i += 1
             continue
         if ch == "'":
             in_single = True
             cur.append(ch)
+            i += 1
             continue
         if ch == '"':
             in_double = True
             cur.append(ch)
+            i += 1
             continue
         if is_sep(ch):
             parts.append("".join(cur))
             cur = []
+            i += 1
             continue
         cur.append(ch)
+        i += 1
     parts.append("".join(cur))
     return parts
 
 
 def _unquote(token: str) -> str:
-    """Literal value of a token with its surrounding quotes removed."""
+    """Literal value of a token: strip surrounding quotes and resolve escapes."""
     out = []
+    i = 0
+    n = len(token)
     in_single = in_double = False
-    for ch in token:
+    while i < n:
+        ch = token[i]
         if in_single:
             if ch == "'":
                 in_single = False
             else:
                 out.append(ch)
+            i += 1
             continue
         if in_double:
             if ch == '"':
                 in_double = False
             else:
                 out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 < n:
+                out.append(token[i + 1])
+                i += 2
+            else:
+                i += 1
             continue
         if ch == "'":
             in_single = True
+            i += 1
             continue
         if ch == '"':
             in_double = True
+            i += 1
             continue
         out.append(ch)
+        i += 1
     return "".join(out)
 
 
 def _has_glob(command: str) -> bool:
-    """True iff the command has an unquoted `*` or `?`."""
+    """True iff the command has an unquoted, unescaped `*` or `?`."""
+    i = 0
+    n = len(command)
     in_single = in_double = False
-    for ch in command:
+    while i < n:
+        ch = command[i]
         if in_single:
             if ch == "'":
                 in_single = False
+            i += 1
             continue
         if in_double:
             if ch == '"':
                 in_double = False
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2 if i + 1 < n else 1
             continue
         if ch == "'":
             in_single = True
+            i += 1
             continue
         if ch == '"':
             in_double = True
+            i += 1
             continue
         if ch in "*?":
             return True
+        i += 1
     return False
+
+
+def _stages(command: str):
+    """Pipeline stages of a canonical command (split on unquoted, unescaped `|`)."""
+    return _scan_split(command, lambda c: c == "|")
 
 
 def _stage_program(stage: str):
@@ -191,8 +266,13 @@ def _stage_program(stage: str):
 
 
 def _programs(command: str):
-    """All programs a (canonical) command runs, one per unquoted-`|` stage."""
-    return [_stage_program(stage) for stage in _scan_split(command, lambda c: c == "|")]
+    """All programs a (canonical) command runs, one per pipeline stage."""
+    return [_stage_program(stage) for stage in _stages(command)]
+
+
+def _points(command: str) -> int:
+    """Recomputed challenge points: 7 * (#stages) + character length."""
+    return 7 * len(_stages(command)) + len(command)
 
 
 def _is_safe(command: str, approved: set) -> bool:
@@ -244,14 +324,23 @@ def _build_reference() -> sqlite3.Connection:
         "AND a.command = challenge_checks.expected_command)"
     )
 
-    # Rule 5: delete non-usable doors.
+    # Rule 5: recompute points for surviving challenge_checks.
+    for row_id, expected in cur.execute(
+        "SELECT id, expected_command FROM challenge_checks"
+    ).fetchall():
+        cur.execute(
+            "UPDATE challenge_checks SET points = ? WHERE id = ?",
+            (_points(expected), row_id),
+        )
+
+    # Rule 6: delete non-usable doors.
     cur.execute(
         "DELETE FROM doors WHERE NOT EXISTS ("
         "SELECT 1 FROM allowed_commands a "
         "WHERE a.room_id = doors.from_room AND a.command = doors.via_command)"
     )
 
-    # Rule 6: reachability from room 1 over surviving doors.
+    # Rule 7: reachability from room 1 over surviving doors.
     adj = {}
     for f, t in cur.execute("SELECT from_room, to_room FROM doors").fetchall():
         adj.setdefault(f, []).append(t)
@@ -270,7 +359,7 @@ def _build_reference() -> sqlite3.Connection:
             (0 if room_id in reachable else 1, room_id),
         )
 
-    # Rule 7: per-room cmd_digest.
+    # Rule 8: per-room cmd_digest.
     digests = {}
     for room_id in room_ids:
         cmds = [
@@ -283,7 +372,7 @@ def _build_reference() -> sqlite3.Connection:
         digests[room_id] = digest
         cur.execute("UPDATE rooms SET cmd_digest = ? WHERE id = ?", (digest, room_id))
 
-    # Rule 8: signed manifest.
+    # Rule 9: signed manifest.
     message = "\n".join(f"{room_id}={digests[room_id]}" for room_id in room_ids)
     manifest = hmac.new(HMAC_KEY, message.encode("utf-8"), hashlib.sha256).hexdigest()
     cur.execute("UPDATE meta SET value = ? WHERE key = 'manifest'", (manifest,))
@@ -479,6 +568,84 @@ def test_manifest_hmac():
         )
     finally:
         con.close()
+
+
+def test_points_recomputed():
+    """Rule 5: each surviving challenge's points == 7*stages + canonical length."""
+    con = _open_agent_db()
+    try:
+        for room_id, expected_command, points in con.execute(
+            "SELECT room_id, expected_command, points FROM challenge_checks"
+        ):
+            assert points == _points(expected_command), (
+                f"Room {room_id} challenge {expected_command!r}: points={points}, "
+                f"expected {_points(expected_command)}"
+            )
+    finally:
+        con.close()
+
+
+def test_lexer_edge_cases():
+    """Quote/escape traps: quoted or escaped globs/pipes/spaces are literal and
+    their commands survive, while unquoted globs and bad pipelines are removed."""
+    con = _open_agent_db()
+    try:
+        commands = {c for (c,) in con.execute("SELECT command FROM allowed_commands")}
+        must_keep = [
+            "echo '*'",      # quoted glob -> literal
+            "echo \\*",      # escaped glob -> literal
+            "echo 'a|b'",    # quoted pipe -> single stage
+            "echo a\\ b",    # escaped space -> single argument
+            "tr a\\|b x",    # escaped pipe -> single stage, program tr
+        ]
+        for cmd in must_keep:
+            assert cmd in commands, f"safe command should survive: {cmd!r}"
+        must_drop = [
+            "ls *",                  # unquoted glob
+            "cat data | grep flag",  # non-coreutils stage
+        ]
+        for cmd in must_drop:
+            assert cmd not in commands, f"unsafe command should be removed: {cmd!r}"
+    finally:
+        con.close()
+
+
+def test_untouched_data_preserved():
+    """Columns/rows not mentioned by the rules are left exactly as seeded."""
+    seed = sqlite3.connect(":memory:")
+    seed.executescript(Path(SEED_PATH).read_text())
+    con = _open_agent_db()
+    try:
+        expected = seed.execute(
+            "SELECT id, name, description FROM rooms ORDER BY id"
+        ).fetchall()
+        actual = con.execute(
+            "SELECT id, name, description FROM rooms ORDER BY id"
+        ).fetchall()
+        assert actual == expected, "room name/description columns were modified"
+        (schema_version,) = con.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert schema_version == "1", "meta.schema_version was modified"
+    finally:
+        con.close()
+        seed.close()
+
+
+def test_no_extra_or_missing_rows():
+    """Every table's row count matches the independently recomputed reference."""
+    reference = _build_reference()
+    con = _open_agent_db()
+    try:
+        for table in ("rooms", "allowed_commands", "challenge_checks", "doors", "meta"):
+            expected = reference.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            actual = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            assert actual == expected, (
+                f"{table} has {actual} rows, expected {expected}"
+            )
+    finally:
+        con.close()
+        reference.close()
 
 
 def test_row_ids_preserved():
