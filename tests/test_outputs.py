@@ -22,9 +22,11 @@ from pathlib import Path
 
 DB_PATH = "/app/game/escape.db"
 SEED_PATH = str(Path(__file__).resolve().parent / "seed_reference.sql")
-# Trusted copy of the binary policy the verifier carries (never the agent's copy
-# at /app/game/policy.bin), so the derived key/denylist cannot be tampered with.
+# Trusted copies the verifier carries (never the agent-writable equivalents at
+# /app/game/policy.bin or /app/game/dossier.md), so derived parameters cannot be
+# tampered with.
 POLICY_PATH = str(Path(__file__).resolve().parent / "policy.bin")
+DOSSIER_PATH = str(Path(__file__).resolve().parent / "dossier.md")
 
 BASE_DENYLIST = {"rm", "dd", "shred", "chroot", "runcon"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -57,6 +59,35 @@ def _parse_policy(path: str):
 
 DIGEST_ROUNDS, HMAC_KEY, _EXTRA_DENY = _parse_policy(POLICY_PATH)
 DENYLIST = BASE_DENYLIST | _EXTRA_DENY
+
+_DIRECTIVE_RE = re.compile(
+    r"\s*REV\s+(\d+)\s*\|\s*param=(\S+)\s*\|\s*value=(.*?)\s*\|\s*"
+    r"supersedes=(\S+)\s*\|\s*status=(\S+)\s*$"
+)
+
+
+def _dossier_param(path: str, param: str) -> str:
+    """Effective value of `param` from the dossier: ignore revoked directives;
+    among active ones for the param, pick the directive whose REV no other active
+    directive supersedes (greatest REV breaks ties)."""
+    actives = []  # (rev:int, value:str, supersedes:str)
+    for raw in Path(path).read_text().splitlines():
+        line = raw.split("#", 1)[0]
+        m = _DIRECTIVE_RE.match(line)
+        if not m:
+            continue
+        rev, p, val, sup, status = m.groups()
+        if p == param and status == "active":
+            actives.append((int(rev), val, sup))
+    superseded = {a[2] for a in actives if a[2] != "none"}
+    cands = [a for a in actives if f"{a[0]:04d}" not in superseded]
+    assert cands, f"no effective directive found for {param}"
+    cands.sort(key=lambda a: a[0])
+    return cands[-1][1]
+
+
+POINTS_MULTIPLIER = int(_dossier_param(DOSSIER_PATH, "points_multiplier"))
+DIGEST_SALT = _dossier_param(DOSSIER_PATH, "digest_salt")
 
 # The programs shipped by GNU coreutils 9.5 (the trusted allowlist). This is the
 # same set the agent is expected to extract from the staged tarball's README; we
@@ -305,8 +336,8 @@ def _programs(command: str):
 
 
 def _points(command: str) -> int:
-    """Recomputed challenge points: 7 * (#stages) + character length."""
-    return 7 * len(_stages(command)) + len(command)
+    """Recomputed challenge points: points_multiplier * (#stages) + character length."""
+    return POINTS_MULTIPLIER * len(_stages(command)) + len(command)
 
 
 def _is_safe(command: str, approved: set) -> bool:
@@ -318,6 +349,11 @@ def _is_safe(command: str, approved: set) -> bool:
         if prog is None or prog not in approved or prog in DENYLIST:
             return False
     return True
+
+
+def _room_message(cmds) -> str:
+    """Rule 8 message: digest_salt as the first line, then the sorted commands."""
+    return "\n".join([DIGEST_SALT] + sorted(cmds))
 
 
 def _digest(text: str) -> str:
@@ -412,7 +448,7 @@ def _build_reference() -> sqlite3.Connection:
                 "SELECT command FROM allowed_commands WHERE room_id = ?", (room_id,)
             ).fetchall()
         ]
-        digest = _digest("\n".join(sorted(cmds)))
+        digest = _digest(_room_message(cmds))
         digests[room_id] = digest
         cur.execute("UPDATE rooms SET cmd_digest = ? WHERE id = ?", (digest, room_id))
 
@@ -584,7 +620,7 @@ def test_cmd_digests_recomputed():
                     "SELECT command FROM allowed_commands WHERE room_id = ?", (room_id,)
                 ).fetchall()
             ]
-            expected = _digest("\n".join(sorted(cmds)))
+            expected = _digest(_room_message(cmds))
             (actual,) = con.execute(
                 "SELECT cmd_digest FROM rooms WHERE id = ?", (room_id,)
             ).fetchone()

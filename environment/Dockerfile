@@ -38,4 +38,7 @@ RUN sqlite3 /app/game/escape.db < /opt/seed/seed.sql
 # Stage the binary policy blob the migration must parse (magic/version/CRC32).
 COPY policy.bin /app/game/policy.bin
 
+# Stage the policy dossier (change-log the migration mines parameters from).
+COPY dossier.md /app/game/dossier.md
+
 WORKDIR /app

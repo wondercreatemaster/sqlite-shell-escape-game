@@ -19,6 +19,30 @@ awk '
   | sed '/^[[:space:]]*$/d' \
   | sort -u > "$WORK/allowed_utils.txt"
 
+# 1b) Mine the effective parameters from the policy dossier (chain resolution).
+read_param() {
+  python3 - "/app/game/dossier.md" "$1" <<'PYEOF'
+import sys, re
+path, param = sys.argv[1], sys.argv[2]
+rx = re.compile(r"\s*REV\s+(\d+)\s*\|\s*param=(\S+)\s*\|\s*value=(.*?)\s*\|\s*supersedes=(\S+)\s*\|\s*status=(\S+)\s*$")
+actives = []
+for raw in open(path):
+    line = raw.split("#", 1)[0]
+    m = rx.match(line)
+    if not m:
+        continue
+    rev, p, val, sup, status = m.groups()
+    if p == param and status == "active":
+        actives.append((int(rev), val, sup))
+superseded = {a[2] for a in actives if a[2] != "none"}
+cands = [a for a in actives if f"{a[0]:04d}" not in superseded]
+cands.sort(key=lambda a: a[0])
+print(cands[-1][1])
+PYEOF
+}
+POINTS_MULT="$(read_param points_multiplier)"
+DIGEST_SALT="$(read_param digest_salt)"
+
 # 2) Apply the hardening rules to the SQLite database via a Java (JDBC) migration.
 cat > "$WORK/Migrate.java" <<'JAVA'
 import java.nio.ByteBuffer;
@@ -263,6 +287,8 @@ public class Migrate {
     public static void main(String[] args) throws Exception {
         String db = args[0];
         String listFile = args[1];
+        int pointsMultiplier = Integer.parseInt(args[2]);
+        String digestSalt = args[3];
 
         approved = new HashSet<>();
         for (String line : Files.readAllLines(Paths.get(listFile))) {
@@ -344,7 +370,7 @@ public class Migrate {
                          "SELECT id, expected_command FROM challenge_checks")) {
                 while (rs.next()) {
                     String cmd = rs.getString(2);
-                    int pts = 7 * scanSplit(cmd, false).size() + cmd.length();
+                    int pts = pointsMultiplier * scanSplit(cmd, false).size() + cmd.length();
                     pointUpdates.put(rs.getInt(1), pts);
                 }
             }
@@ -412,7 +438,10 @@ public class Migrate {
                     }
                 }
                 Collections.sort(cmds);
-                String digest = iteratedDigestHex(String.join("\n", cmds), digestRounds);
+                List<String> message = new ArrayList<>();
+                message.add(digestSalt);
+                message.addAll(cmds);
+                String digest = iteratedDigestHex(String.join("\n", message), digestRounds);
                 digests.put(roomId, digest);
                 try (PreparedStatement ps = c.prepareStatement(
                         "UPDATE rooms SET cmd_digest = ? WHERE id = ?")) {
@@ -442,4 +471,5 @@ public class Migrate {
 JAVA
 
 javac -cp "/opt/java-libs/*" -d "$WORK" "$WORK/Migrate.java"
-java -cp "$WORK:/opt/java-libs/*" Migrate /app/game/escape.db "$WORK/allowed_utils.txt"
+java -cp "$WORK:/opt/java-libs/*" Migrate /app/game/escape.db "$WORK/allowed_utils.txt" \
+     "$POINTS_MULT" "$DIGEST_SALT"
